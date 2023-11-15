@@ -269,7 +269,7 @@ void pdvdana::FitdQdx::analyze(art::Event const& e)
       }
 
       // Cut tracks that are not within specified thresholds
-      if(track.Length() < fTrackLenMin || track.Length() > fTrackLenMax) continue;
+      if(track.Length() < fTrackLenMin || track.Length() > fTrackLenMax){fTree->Fill(); fTrackId++; continue;}
 
       // Retrieve begining and end of the track
       fTrackStartX = track.Start().X();
@@ -280,16 +280,16 @@ void pdvdana::FitdQdx::analyze(art::Event const& e)
       fTrackEndZ   = track.End().Z();
 
       // Remove tracks that start outside the detector in the horizontal plane
-      if(fTrackStartY < fYmin || fTrackStartY > fYmax) continue;
-      if(fTrackStartZ < fZmin || fTrackStartZ > fZmax) continue;
+      if(fTrackStartY < fYmin || fTrackStartY > fYmax){fTree->Fill(); fTrackId++;  continue;}
+      if(fTrackStartZ < fZmin || fTrackStartZ > fZmax){fTree->Fill(); fTrackId++;  continue;}
 
       // Remove tracks that end   outside the detector in the horizontal plane
-      if(fTrackEndY < fYmin   || fTrackEndY > fYmax)   continue;
-      if(fTrackEndZ < fZmin   || fTrackEndZ > fZmax)   continue;
+      if(fTrackEndY < fYmin   || fTrackEndY > fYmax){fTree->Fill(); fTrackId++;    continue;}
+      if(fTrackEndZ < fZmin   || fTrackEndZ > fZmax){fTree->Fill(); fTrackId++;    continue;}
      
       // Remove tracks that are not crossing the anode/cathode planes
       // -> unknown drift time
-      if(fabs(fTrackStartX - fTrackEndX) < 0.95*fHeight || fabs(fTrackStartX - fTrackEndX) > 1.05*fHeight) continue;
+      if(fabs(fTrackStartX - fTrackEndX) < 0.95*fHeight || fabs(fTrackStartX - fTrackEndX) > 1.05*fHeight){fTree->Fill(); fTrackId++; continue;}
 
       // Check if the track is reconstructed upwards or downwards
       // for now, assume all reconstructed muons should be going downwards
