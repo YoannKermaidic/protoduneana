@@ -73,7 +73,6 @@ private:
 
   // Parameters set in the input FHICL file (verbosity, module name, thresholds, ...)
   int      fLogLevel;
-  string   fWireModuleLabel;
   string   fTrackModuleLabel;
   string   fCaloModuleLabel;
   float    fFiducialCut;
@@ -139,7 +138,6 @@ private:
 pddpana::GetStoppingParticles::GetStoppingParticles(fhicl::ParameterSet const& p)
   : EDAnalyzer{p} ,
   fLogLevel( p.get< int >("LogLevel") ),
-  fWireModuleLabel(  p.get< std::string  >("WireModuleLabel") ),
   fTrackModuleLabel( p.get< std::string  >("TrackModuleLabel") ),
   fCaloModuleLabel(  p.get< std::string  >("CaloModuleLabel") ),
   fFiducialCut(   p.get< float  >("FiducialCut") ),

@@ -35,8 +35,8 @@ physics:
     {
         module_type:  "GetStoppingParticles"
         LogLevel:      0 
-        WireModuleLabel:  "caldata"
         TrackModuleLabel:  "pandoraTrack"
+        CaloModuleLabel:   "gnocalo"
         FiducialCut:   5.0
         TrackCurvature:5.0  # cut curved reconstructed tracks
         TrackDelta:    10.0
