@@ -95,6 +95,10 @@ class ThinSliceSample {
     return fSelectionHists.at(id);
   };
 
+  TH1 * GetExtraHist(std::string category) {
+    return fExtraHists.at(category);
+  };
+
   /*
   TH1D & GetIncidentHist() {
     return fIncidentHist;
@@ -283,9 +287,13 @@ class ThinSliceSample {
   }
 
   int GetSelectionHistBin(int id, double val) const {
-    if (fSelectionHists.find(id) != fSelectionHists.end()) {
-      return fSelectionHists.at(id)->GetXaxis()->FindBin(val);
+    auto it = fSelectionHists.find(id);
+    if (it != fSelectionHists.end()) {
+      return it->second->GetXaxis()->FindBin(val);
     }
+    //if (fSelectionHists.find(id) != fSelectionHists.end()) {
+    //  return fSelectionHists.at(id)->GetXaxis()->FindBin(val);
+    //}
     else {
       return -1;
     }
@@ -293,7 +301,6 @@ class ThinSliceSample {
 
   void FillHistFromIncidentEnergies(TH1D & hist) {
     for (auto vals : fIncidentEnergies) {
-      //hist.Fill(vals.first, fFactor/*vals.second*/);
       hist.Fill(vals.first, fFactor*vals.second);
     }
   };
@@ -314,6 +321,10 @@ class ThinSliceSample {
     for (auto it = fSelectionHists.begin(); it != fSelectionHists.end(); ++it) {
       it->second->Scale(val);
     }
+    for (auto & hist : fExtraHists) {
+      hist.second->Scale(val);
+    }
+
     RefillRebinnedHists();
 
     fTrueIncidentHist.Scale(val);
@@ -333,10 +344,18 @@ class ThinSliceSample {
     }
   };
 
+  const std::map<std::string, TH1 *> & GetExtraHists() const {
+    return fExtraHists;
+  };
+
   void Reset() {
     fVariedFlux = 0.;
     for (auto it = fSelectionHists.begin(); it != fSelectionHists.end(); ++it) {
       it->second->Reset();
+    }
+
+    for (auto & hist : fExtraHists) {
+      hist.second->Reset();
     }
 
     fTrueIncidentHist.Reset();
@@ -417,6 +436,12 @@ class ThinSliceSample {
   void CalculateStatVariations();
   double GetStatVarWeight(int sel, double val) const;
 
+  void FillExtraHist(const std::string & name, double val, double weight=1.);
+
+  void SetupExtraHists(
+    std::vector<fhicl::ParameterSet> & extra_hist_sets,
+    int i, int j);
+
  private:
   double fFactor = 1., fBestFitFactor = 1.;
   bool fBestFitIsSet = false;
@@ -457,6 +482,8 @@ class ThinSliceSample {
   std::vector<std::pair<std::pair<double, double>, double>> fESliceEnergies;
 
   TRandom3 fRNG = TRandom3(0);
+
+  std::map<std::string, TH1 *> fExtraHists;
 
 };
 

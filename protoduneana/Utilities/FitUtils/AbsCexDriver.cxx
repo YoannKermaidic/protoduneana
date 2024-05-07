@@ -22,7 +22,24 @@
 #include "valgrind/callgrind.h"
 
 #include "ThinSliceDriverFactory.h"
+
 DECLARE_THINSLICEDRIVER_FACTORY_NS(protoana::AbsCexDriver, protoana, AbsCexDriver)
+
+double protoana::AbsCexDriver::fStartXDataMean = 0.;
+double protoana::AbsCexDriver::fStartXDataSigma = 0.;
+double protoana::AbsCexDriver::fStartYDataMean = 0.;
+double protoana::AbsCexDriver::fStartYDataSigma = 0.;
+double protoana::AbsCexDriver::fStartZDataMean = 0.;
+double protoana::AbsCexDriver::fStartZDataSigma = 0.;
+double protoana::AbsCexDriver::fStartXMCMean = 0.;
+double protoana::AbsCexDriver::fStartXMCSigma = 0.;
+double protoana::AbsCexDriver::fStartYMCMean = 0.;
+double protoana::AbsCexDriver::fStartYMCSigma = 0.;
+double protoana::AbsCexDriver::fStartZMCMean = 0.;
+double protoana::AbsCexDriver::fStartZMCSigma = 0.;
+
+std::vector<double> fG4RWVars = {};
+std::vector<std::string> fG4RWBranches = {};
 
 protoana::AbsCexDriver::~AbsCexDriver() {}
 
@@ -46,7 +63,9 @@ protoana::AbsCexDriver::AbsCexDriver(
       fDebugRestrictBeamP(extra_options.get<bool>("DebugRestrictBeamP", false)),
       fVaryDataCalibration(extra_options.get<bool>("VaryDataCalibration", false)),
       fDataCalibrationFactor(extra_options.get<double>("DataCalibrationFactor", 1.)),
-      fNThreads(extra_options.get<int>("NThreads", 1)) {
+      fNThreads(extra_options.get<int>("NThreads", 1)),
+      fExtraHistSets(extra_options.get<std::vector<fhicl::ParameterSet>>(
+          "ExtraHists", {})) {
   if (fSliceMethod == "Alt") {
     fIn = new TFile("end_slices.root", "OPEN");
     fEndSlices = (TH2D*)fIn->Get("h2D")->Clone();
@@ -92,6 +111,9 @@ protoana::AbsCexDriver::AbsCexDriver(
       = extra_options.get<std::vector<fhicl::ParameterSet>>(
           "CovarianceRoutines", {});
 
+  fFakeResolution = extra_options.get<double>("FakeResolution", -999.);
+  if (fFakeResolution > 0.) fStoredEnergies = std::vector<std::vector<double>>(fNWorkers);
+
   for (auto & routine : cov_routines) {
     std::string name = routine.get<std::string>("Name");
     fCovarianceRoutines.push_back(name);
@@ -99,13 +121,40 @@ protoana::AbsCexDriver::AbsCexDriver(
       SetupBeamShiftCovRoutine(routine);
     }
   }
+
+  if (fFakeDataRoutine == "G4RWGrid") {
+    SetupFakeDataG4RW();
+    FakeDataWeight = GetFakeWeight_G4RWCoeff;
+  }
+  else {
+    FakeDataWeight = DummyWeight; 
+  }
+
+  fThrowCalibration = extra_options.get<bool>("ThrowCalibration", false);
+  fVaryCalibrationFakeData = extra_options.get<bool>("VaryCalibrationFakeData",
+                                                     false);
+  if (fThrowCalibration) {
+    fDataCalibrationFactor = fRNG.Gaus(1., fDataCalibrationFactor);
+    std::cout << "New cal factor: " << fDataCalibrationFactor << std::endl;
+  }
+
+  fRandomFakeDataBeamShift = extra_options.get<bool>("RandomFakeDataBeamShift", false);
+  fRandomMCBeamShift = extra_options.get<bool>("RandomMCBeamShift", false);
+  fUseBeamShift = extra_options.get<bool>("UseBeamShift", false);
+
+  if (fUseBeamShift) {
+    fBeamShiftCovRoutineActive = true;
+    OpenBeamShiftInput();
+    GenerateBeamShiftUniverse();
+
+  }
 }
 
 void protoana::AbsCexDriver::FillMCEvents(
     TTree * tree, std::vector<ThinSliceEvent> & events,
     std::vector<ThinSliceEvent> & fake_data_events,
     int & split_val, const bool & do_split, const bool & shuffle,
-    int max_entries, const bool & do_fake_data) {
+    int max_entries, int max_fake_entries, const bool & do_fake_data) {
   std::cout << "Filling MC Events" << std::endl;
 
   int sample_ID, selection_ID, event, run, subrun;
@@ -113,6 +162,9 @@ void protoana::AbsCexDriver::FillMCEvents(
   double true_beam_interactingEnergy, reco_beam_interactingEnergy;
   double true_beam_endP, true_beam_mass, true_beam_endZ;
   double reco_beam_endZ, true_beam_startP, reco_beam_startY;
+  double reco_beam_startX_SCE, reco_beam_startY_SCE, reco_beam_startZ_SCE;
+  double vertex_michel_score;
+  int vertex_nhits;
   double beam_inst_P;
   double leading_p_costheta, leading_piplus_costheta, leading_pi0_costheta;
   std::vector<double> * reco_beam_incidentEnergies = 0x0,
@@ -121,7 +173,7 @@ void protoana::AbsCexDriver::FillMCEvents(
                       * true_beam_traj_KE = 0x0,
                       * reco_daughter_track_thetas = 0x0,
                       * reco_daughter_track_scores = 0x0;
-  std::vector<int> * true_beam_slices = 0x0;
+  //std::vector<int> * true_beam_slices = 0x0;
   tree->SetBranchAddress("event", &event); //good
   tree->SetBranchAddress("subrun", &subrun); //good
   tree->SetBranchAddress("run", &run); //good
@@ -144,21 +196,26 @@ void protoana::AbsCexDriver::FillMCEvents(
   tree->SetBranchAddress("reco_beam_interactingEnergy", //good
                          &reco_beam_interactingEnergy);
   tree->SetBranchAddress("reco_beam_endZ", &reco_beam_endZ); //good
+  tree->SetBranchAddress("reco_beam_calo_startX", &reco_beam_startX_SCE);
+  tree->SetBranchAddress("reco_beam_calo_startY", &reco_beam_startY_SCE);
+  tree->SetBranchAddress("reco_beam_calo_startZ", &reco_beam_startZ_SCE);
+  tree->SetBranchAddress("reco_beam_vertex_michel_score", &vertex_michel_score);
+  tree->SetBranchAddress("reco_beam_vertex_nHits", &vertex_nhits);
   tree->SetBranchAddress("reco_beam_startY", &reco_beam_startY); //good
   tree->SetBranchAddress("reco_beam_incidentEnergies", //good
                          &reco_beam_incidentEnergies);
   tree->SetBranchAddress("true_beam_incidentEnergies", //good
                          &true_beam_incidentEnergies);
-  tree->SetBranchAddress("true_beam_slices", //good
-                         &true_beam_slices);
+  /*tree->SetBranchAddress("true_beam_slices", //good
+                         &true_beam_slices);*/
   tree->SetBranchAddress("true_beam_startP", &true_beam_startP); //good
   tree->SetBranchAddress("true_beam_traj_Z", &true_beam_traj_Z); //good
   tree->SetBranchAddress("true_beam_traj_KE", &true_beam_traj_KE); //good
-  std::vector<double> * calibrated_dQdX = 0x0, * beam_EField = 0x0, //good
-                      * track_pitch = 0x0; //good
-  tree->SetBranchAddress("reco_beam_calibrated_dQdX_SCE", &calibrated_dQdX); //good
-  tree->SetBranchAddress("reco_beam_EField_SCE", &beam_EField); //good
-  tree->SetBranchAddress("reco_beam_TrkPitch_SCE", &track_pitch); //good
+  /*std::vector<double> * calibrated_dQdX = 0x0, * beam_EField = 0x0, //good
+                      * track_pitch = 0x0; //good*/
+  //tree->SetBranchAddress("reco_beam_calibrated_dQdX_SCE", &calibrated_dQdX); //good
+  //tree->SetBranchAddress("reco_beam_EField_SCE", &beam_EField); //good
+  //tree->SetBranchAddress("reco_beam_TrkPitch_SCE", &track_pitch); //good
   tree->SetBranchAddress("beam_inst_P", &beam_inst_P); //good
   tree->SetBranchAddress("reco_daughter_allTrack_Theta", &reco_daughter_track_thetas); //good
   tree->SetBranchAddress("reco_daughter_PFP_trackScore_collection", //good
@@ -171,12 +228,21 @@ void protoana::AbsCexDriver::FillMCEvents(
   tree->SetBranchAddress("reco_beam_true_byHits_ID", &reco_beam_true_byHits_ID); //good
 
   std::vector<std::vector<double>> * g4rw_full_grid_proton_coeffs = 0x0,
-                                   * g4rw_full_grid_piplus_coeffs = 0x0,
+                                   //* g4rw_full_grid_piplus_coeffs = 0x0,
+                                   * g4rw_full_fine_piplus_coeffs = 0x0,
+                                   * g4rw_full_grid_abscex_coeffs = 0x0,
+                                   * g4rw_primary_grid_abscex_coeffs = 0x0,
                                    * g4rw_downstream_grid_piplus_coeffs = 0x0;
   tree->SetBranchAddress("g4rw_full_grid_proton_coeffs", //good
                          &g4rw_full_grid_proton_coeffs);
-  tree->SetBranchAddress("g4rw_full_grid_piplus_coeffs",
-                         &g4rw_full_grid_piplus_coeffs);
+  //tree->SetBranchAddress("g4rw_full_grid_piplus_coeffs",
+  //                       &g4rw_full_grid_piplus_coeffs);
+  tree->SetBranchAddress("g4rw_full_fine_piplus_coeffs",
+                         &g4rw_full_fine_piplus_coeffs);
+  tree->SetBranchAddress("g4rw_full_grid_abscex_coeffs",
+                         &g4rw_full_grid_abscex_coeffs);
+  tree->SetBranchAddress("g4rw_primary_grid_abscex_coeffs",
+                         &g4rw_primary_grid_abscex_coeffs);
   tree->SetBranchAddress("g4rw_downstream_grid_piplus_coeffs", //good
                          &g4rw_downstream_grid_piplus_coeffs);
 
@@ -199,6 +265,16 @@ void protoana::AbsCexDriver::FillMCEvents(
   bool is_beam_scraper;
   tree->SetBranchAddress("true_beam_is_scraper", &is_beam_scraper);//good
 
+  std::vector<double> * reco_daughter_chi2 = 0x0,
+                      * reco_daughter_truncated_dEdX = 0x0;
+  std::vector<int> * reco_daughter_chi2_nhits = 0x0;
+  tree->SetBranchAddress("reco_daughter_allTrack_Chi2_proton",
+                         &reco_daughter_chi2);
+  tree->SetBranchAddress("reco_daughter_allTrack_Chi2_ndof",
+                         &reco_daughter_chi2_nhits);
+  tree->SetBranchAddress("reco_daughter_allTrack_truncLibo_dEdX_pos",
+                         &reco_daughter_truncated_dEdX);
+
   int nentries = (max_entries < 0 ? tree->GetEntries() : max_entries);
   if (max_entries > tree->GetEntries()) {
       std::string message = "Requested more entries than in MC tree";
@@ -207,8 +283,8 @@ void protoana::AbsCexDriver::FillMCEvents(
 
   split_val = nentries;
 
-  int /*events_start = 0,*/ events_end = nentries;
-  int fake_start = 0/*, fake_end = nentries*/;
+  int events_end = nentries;
+  int fake_start = 0;
 
   std::vector<int> event_list, fake_event_list;
 
@@ -252,8 +328,15 @@ void protoana::AbsCexDriver::FillMCEvents(
     }
   }
   else {
+    int nfake_entries = (max_fake_entries < 0 ? tree->GetEntries() : max_fake_entries);
+    if (max_fake_entries > tree->GetEntries()) {
+        std::string message = "Requested more fake_entries than in MC tree";
+        throw std::runtime_error(message);
+    }
     for (int i = 0; i < events_end; ++i) {
       event_list.push_back(i);
+    }
+    for (int i = 0; i < nfake_entries; ++i) {
       fake_event_list.push_back(i);
     }
   }
@@ -404,6 +487,7 @@ void protoana::AbsCexDriver::FillMCEvents(
 
     //ThinSliceEvent thin_slice_event(event, subrun, run);
     events.push_back(ThinSliceEvent(event, subrun, run));
+    events.back().SetMCStatVarWeight(fRNG.Poisson(1));
     events.back().SetSampleID(sample_ID);
     events.back().SetSelectionID(selection_ID);
     events.back().SetTrueInteractingEnergy(true_beam_interactingEnergy);
@@ -414,31 +498,50 @@ void protoana::AbsCexDriver::FillMCEvents(
     events.back().SetTrueMass(true_beam_mass);
     events.back().SetRecoEndZ(reco_beam_endZ);
     events.back().SetRecoStartY(reco_beam_startY);
+    events.back().SetRecoStartX_SCE(reco_beam_startX_SCE);
+    events.back().SetRecoStartY_SCE(reco_beam_startY_SCE);
+    events.back().SetRecoStartZ_SCE(reco_beam_startZ_SCE);
+
+    events.back().SetVertexMichelScore(vertex_michel_score);
+    events.back().SetVertexNHits(vertex_nhits);
 
     events.back().SetTrueID(true_beam_ID);
     events.back().SetRecoToTrueID(reco_beam_true_byHits_ID);
 
     events.back().SetRecoIncidentEnergies(*reco_beam_incidentEnergies);
-    events.back().SetTrueIncidentEnergies(*true_beam_incidentEnergies);
+    //events.back().SetTrueIncidentEnergies(*true_beam_incidentEnergies);
+    events.back().SetTrueInitEnergy(
+      (true_beam_incidentEnergies->size() > 0 ?
+       true_beam_incidentEnergies->at(0) : -999.));
     events.back().SetTrueTrajZ(*true_beam_traj_Z);
     events.back().SetTrueTrajKE(*true_beam_traj_KE);
-    events.back().SetTrueSlices(*true_beam_slices);
-    events.back().SetdQdXCalibrated(*calibrated_dQdX);
-    events.back().SetEField(*beam_EField);
-    events.back().SetTrackPitch(*track_pitch);
+    //events.back().SetTrueSlices(*true_beam_slices);
+    //events.back().SetdQdXCalibrated(*calibrated_dQdX);
+    //events.back().SetEField(*beam_EField);
+    //events.back().SetTrackPitch(*track_pitch);
     events.back().SetBeamInstP(beam_inst_P);
     events.back().SetPDG(true_beam_PDG);
-    events.back().SetRecoDaughterTrackThetas(*reco_daughter_track_thetas);
+    //events.back().SetRecoDaughterTrackThetas(*reco_daughter_track_thetas);
     events.back().SetRecoDaughterTrackScores(*reco_daughter_track_scores);
     events.back().SetHasPi0Shower(has_pi0_shower);
     events.back().SetLeadingPCostheta(leading_p_costheta);
     events.back().SetLeadingPiPlusCostheta(leading_piplus_costheta);
     events.back().SetLeadingPi0Costheta(leading_pi0_costheta);
     events.back().SetIsBeamScraper(is_beam_scraper);
+
     for (size_t j = 0; j < daughter_dQdXs->size(); ++j) {
-      events.back().AddRecoDaughterTrackdQdX((*daughter_dQdXs)[j]);
-      events.back().AddRecoDaughterTrackResRange((*daughter_resRanges)[j]);
+      //events.back().AddRecoDaughterTrackdQdX((*daughter_dQdXs)[j]);
+      //events.back().AddRecoDaughterTrackResRange((*daughter_resRanges)[j]);
       events.back().AddRecoDaughterEField((*daughter_EFields)[j]);
+      auto nhits = (*reco_daughter_chi2_nhits)[j];
+      events.back().AddOneChi2PerHit(
+          (nhits > 0) ?
+          (*reco_daughter_chi2)[j]/nhits :
+          -999.
+      );
+      events.back().AddOneTrunc_dEdX(
+        (*reco_daughter_truncated_dEdX)[j]
+      );
     }
 
     for (size_t j = 0; j < g4rw_downstream_grid_piplus_coeffs->size(); ++j) {
@@ -446,7 +549,27 @@ void protoana::AbsCexDriver::FillMCEvents(
                                    std::to_string(j);
       events.back().MakeG4RWCoeff(name_downstream,
                                   (*g4rw_downstream_grid_piplus_coeffs)[j]);
+
+      //std::string name_full = "g4rw_full_grid_piplus_coeffs_" + std::to_string(j);
+      //events.back().MakeG4RWCoeff(name_full, (*g4rw_full_grid_piplus_coeffs)[j]);
     }
+
+    for (size_t j = 0; j < g4rw_full_fine_piplus_coeffs->size(); ++j) {
+      std::string fine_full = "g4rw_full_fine_piplus_coeffs_" + std::to_string(j);
+      events.back().MakeG4RWCoeff(fine_full, (*g4rw_full_fine_piplus_coeffs)[j]);
+    }
+
+    for (size_t j = 0; j < g4rw_full_grid_abscex_coeffs->size(); ++j) {
+      std::string abscex = "g4rw_full_grid_abscex_coeffs_" + std::to_string(j);
+      events.back().MakeG4RWCoeff(abscex, (*g4rw_full_grid_abscex_coeffs)[j]);
+    }
+
+    /*
+    for (size_t j = 0; j < g4rw_primary_grid_abscex_coeffs->size(); ++j) {
+      std::string abscex = "g4rw_primary_grid_abscex_coeffs_" + std::to_string(j);
+      events.back().MakeG4RWCoeff(abscex, (*g4rw_primary_grid_abscex_coeffs)[j]);
+    }*/
+
     events.back().MakeG4RWCoeff("g4rw_full_grid_proton_coeffs",
                                 (*g4rw_full_grid_proton_coeffs)[0]);
 
@@ -469,7 +592,7 @@ void protoana::AbsCexDriver::FillMCEvents(
   }
 
   if (do_fake_data) {
-    std::cout << "Filling fake data" << std::endl;
+    std::cout << "Filling fake data " << fake_event_list.size() << std::endl;
     //for (int i = fake_start; i < fake_end; ++i) {
     auto start_time = std::chrono::high_resolution_clock::now();
     for (int & i : fake_event_list) {
@@ -479,6 +602,7 @@ void protoana::AbsCexDriver::FillMCEvents(
       fake_data_events.push_back(ThinSliceEvent(event, subrun, run));
       if (!(fake_data_events.size() % 20000))
         std::cout << fake_data_events.size() << std::endl;
+      fake_data_events.back().SetMCStatVarWeight(fRNG.Poisson(1));
       fake_data_events.back().SetSampleID(sample_ID);
       fake_data_events.back().SetSelectionID(selection_ID);
       fake_data_events.back().SetTrueInteractingEnergy(true_beam_interactingEnergy);
@@ -488,18 +612,27 @@ void protoana::AbsCexDriver::FillMCEvents(
       fake_data_events.back().SetTrueStartP(true_beam_startP);
       fake_data_events.back().SetTrueMass(true_beam_mass);
       fake_data_events.back().SetRecoEndZ(reco_beam_endZ);
+      fake_data_events.back().SetRecoStartX_SCE(reco_beam_startX_SCE);
+      fake_data_events.back().SetRecoStartY_SCE(reco_beam_startY_SCE);
+      fake_data_events.back().SetRecoStartZ_SCE(reco_beam_startZ_SCE);
+      fake_data_events.back().SetVertexMichelScore(vertex_michel_score);
+      fake_data_events.back().SetVertexNHits(vertex_nhits);
 
       fake_data_events.back().SetRecoIncidentEnergies(*reco_beam_incidentEnergies);
-      fake_data_events.back().SetTrueIncidentEnergies(*true_beam_incidentEnergies);
+      //fake_data_events.back().SetTrueIncidentEnergies(*true_beam_incidentEnergies);
+      fake_data_events.back().SetTrueInitEnergy(
+          (true_beam_incidentEnergies->size() > 0 ?
+           true_beam_incidentEnergies->at(0) : -999.));
       fake_data_events.back().SetTrueTrajZ(*true_beam_traj_Z);
       fake_data_events.back().SetTrueTrajKE(*true_beam_traj_KE);
-      fake_data_events.back().SetTrueSlices(*true_beam_slices);
-      fake_data_events.back().SetdQdXCalibrated(*calibrated_dQdX);
-      fake_data_events.back().SetEField(*beam_EField);
-      fake_data_events.back().SetTrackPitch(*track_pitch);
+      //fake_data_events.back().SetTrueSlices(*true_beam_slices);
+      //fake_data_events.back().SetdQdXCalibrated(*calibrated_dQdX);
+      //fake_data_events.back().SetEField(*beam_EField);
+      //fake_data_events.back().SetTrackPitch(*track_pitch);
       fake_data_events.back().SetBeamInstP(beam_inst_P);
       fake_data_events.back().SetPDG(true_beam_PDG);
-      fake_data_events.back().SetRecoDaughterTrackThetas(*reco_daughter_track_thetas);
+      if (fFakeDataRoutine == "EffVar") {
+        fake_data_events.back().SetRecoDaughterTrackThetas(*reco_daughter_track_thetas); }
       fake_data_events.back().SetTrueDaughterPDGs(*true_beam_daughter_PDG);
       fake_data_events.back().SetTrueDaughterStartPs(*true_beam_daughter_startP);
       fake_data_events.back().SetRecoDaughterTrackScores(*reco_daughter_track_scores);
@@ -521,16 +654,39 @@ void protoana::AbsCexDriver::FillMCEvents(
       //fake_data_events.back().MakeG4RWBranch("g4rw_full_primary_minus_sigma_weight",
       //                              *g4rw_full_primary_minus_sigma_weight);
       for (size_t j = 0; j < daughter_dQdXs->size(); ++j) {
-        fake_data_events.back().AddRecoDaughterTrackdQdX((*daughter_dQdXs)[j]);
-        fake_data_events.back().AddRecoDaughterTrackResRange((*daughter_resRanges)[j]);
+        //fake_data_events.back().AddRecoDaughterTrackdQdX((*daughter_dQdXs)[j]);
+        //fake_data_events.back().AddRecoDaughterTrackResRange((*daughter_resRanges)[j]);
         fake_data_events.back().AddRecoDaughterEField((*daughter_EFields)[j]);
+        auto nhits = (*reco_daughter_chi2_nhits)[j];
+        fake_data_events.back().AddOneChi2PerHit(
+            (nhits > 0) ?
+            (*reco_daughter_chi2)[j]/nhits :
+            -999.
+        );
+        fake_data_events.back().AddOneTrunc_dEdX(
+          (*reco_daughter_truncated_dEdX)[j]
+        );
       }
+
+      for (size_t j = 0; j < g4rw_full_fine_piplus_coeffs->size(); ++j) {
+        std::string fine_full = "g4rw_full_fine_piplus_coeffs_" + std::to_string(j);
+        fake_data_events.back().MakeG4RWCoeff(fine_full, (*g4rw_full_fine_piplus_coeffs)[j]);
+      }
+      for (size_t j = 0; j < g4rw_full_grid_abscex_coeffs->size(); ++j) {
+        std::string abscex = "g4rw_full_grid_abscex_coeffs_" + std::to_string(j);
+        fake_data_events.back().MakeG4RWCoeff(abscex, (*g4rw_full_grid_abscex_coeffs)[j]);
+
+      }
+      /*for (size_t j = 0; j < g4rw_primary_grid_abscex_coeffs->size(); ++j) {
+        std::string abscex = "g4rw_primary_grid_abscex_coeffs_" + std::to_string(j);
+        fake_data_events.back().MakeG4RWCoeff(abscex, (*g4rw_primary_grid_abscex_coeffs)[j]);
+      }*/
 
       for (size_t j = 0; j < g4rw_downstream_grid_piplus_coeffs->size(); ++j) {
         //std::string name_full = "g4rw_full_grid_weights_" + std::to_string(j);
         //fake_data_events.back().MakeG4RWBranch(name_full, (*g4rw_full_grid_weights)[j]);
-        std::string name_full = "g4rw_full_grid_piplus_coeffs_" + std::to_string(j);
-        fake_data_events.back().MakeG4RWCoeff(name_full, (*g4rw_full_grid_piplus_coeffs)[j]);
+       // std::string name_full = "g4rw_full_grid_piplus_coeffs_" + std::to_string(j);
+       // fake_data_events.back().MakeG4RWCoeff(name_full, (*g4rw_full_grid_piplus_coeffs)[j]);
 
         //std::string name_primary = "g4rw_primary_grid_weights_" +
         //                           std::to_string(j);
@@ -570,7 +726,8 @@ void protoana::AbsCexDriver::FillMCEvents(
     auto delta =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             new_time - start_time).count();
-    std::cout << "Filling fake data took " << delta << std::endl;
+    std::cout << "Filling " << fake_data_events.size() <<
+                 " fake data took " << delta << std::endl;
   }
 
   std::cout << "Filled MC Events" << std::endl;
@@ -601,14 +758,14 @@ void protoana::AbsCexDriver::BuildMCSamples(
 
     const std::vector<double> & reco_beam_incidentEnergies
         = event.GetRecoIncidentEnergies();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
     const std::vector<double> & true_beam_traj_Z
         = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE
         = event.GetTrueTrajKE();
-    const std::vector<int> & true_beam_slices
-        = event.GetTrueSlices();
+    //const std::vector<int> & true_beam_slices
+    //    = event.GetTrueSlices();
 
     //double beam_shift_delta = 0.;
     //if (fBeamShiftCovRoutineActive) {
@@ -636,8 +793,8 @@ void protoana::AbsCexDriver::BuildMCSamples(
 
     //Build the true incident energy vector based on the slice cut
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     //here
     int bin = GetBeamBin(beam_energy_bins, (use_beam_inst_P ? beam_inst_P :
                                             true_beam_startP),
@@ -703,7 +860,6 @@ void protoana::AbsCexDriver::BuildMCSamples(
     nominal_fluxes[flux_type] += 1.;
     this_sample->AddFlux();
     double val[1] = {0};
-    //if (selection_ID == 4) {
     if (std::find(fEndZSelections.begin(), fEndZSelections.end(), selection_ID)
         != fEndZSelections.end()) {
       TH1D * selected_hist
@@ -719,7 +875,6 @@ void protoana::AbsCexDriver::BuildMCSamples(
         val[0] = reco_beam_endZ;
       }
     }
-    //else if (selection_ID > 4) {
     else if (
         std::find(fOneBinSelections.begin(), fOneBinSelections.end(), selection_ID)
         != fOneBinSelections.end()) {
@@ -734,7 +889,6 @@ void protoana::AbsCexDriver::BuildMCSamples(
           if (deltaE > fEnergyFix) {
             energy[0] += deltaE; 
           }
-          //energy[0] += 1.e3*beam_shift_delta;
         }
       }
 
@@ -761,16 +915,19 @@ void protoana::AbsCexDriver::BuildMCSamples(
     //Fill the total incident hist with truth info
     //this_sample->FillTrueIncidentHist(good_true_incEnergies);
     this_sample->AddIncidentEnergies(good_true_incEnergies);
-    if (true_beam_incidentEnergies.size() > 0) {
-    this_sample->AddESliceEnergies(
-        {(true_beam_incidentEnergies)[0],
-         end_energy});
-    }
 
-    this_sample->CalculateStatVariations();
+    FillExtraHistsMC(*this_sample, event, 1.);
+
 
   }
-
+  for (auto & it : samples) {
+    auto & samples_vec_2D = it.second;
+    for (auto & samples_vec : samples_vec_2D) {
+      for (auto & this_sample : samples_vec) {
+        this_sample.CalculateStatVariations();
+      }
+    }
+  }
 }
 
 void protoana::AbsCexDriver::RefillSampleLoop(
@@ -781,6 +938,7 @@ void protoana::AbsCexDriver::RefillSampleLoop(
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P,
     bool fill_incident, std::map<int, TH1 *> * fix_factors,
     size_t worker_id, std::vector<size_t> n_events) {
@@ -791,7 +949,7 @@ void protoana::AbsCexDriver::RefillSampleLoop(
   }
 
   size_t end_event = start_event + n_events[worker_id];
-
+  size_t energy_index = 0;
   for (size_t i = start_event; i < end_event; ++i) {
     const ThinSliceEvent & event = events.at(i);
     int sample_ID = event.GetSampleID();
@@ -805,27 +963,29 @@ void protoana::AbsCexDriver::RefillSampleLoop(
 
     const std::vector<double> & reco_beam_incidentEnergies
         = event.GetRecoIncidentEnergies();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
+    const double & true_beam_initEnergy = event.GetTrueInitEnergy();
     const std::vector<double> & true_beam_traj_Z
         = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE
         = event.GetTrueTrajKE();
-    const std::vector<int> & true_beam_slices
-        = event.GetTrueSlices();
+    //const std::vector<int> & true_beam_slices
+    //    = event.GetTrueSlices();
     double beam_inst_P = event.GetBeamInstP();
-    const std::vector<double> calibrated_dQdX
-        = event.GetdQdXCalibrated();
-    const std::vector<double> beam_EField
-        = event.GetEField();
-    const std::vector<double> track_pitch
-        = event.GetTrackPitch();
+    //const std::vector<double> calibrated_dQdX
+    //    = event.GetdQdXCalibrated();
+    //const std::vector<double> beam_EField
+    //    = event.GetEField();
+    //const std::vector<double> track_pitch
+    //    = event.GetTrackPitch();
     const std::vector<double> daughter_thetas
         = event.GetRecoDaughterTrackThetas();
 
     double beam_shift_delta = 0., beam_energy_delta = 0.;
     if (fBeamShiftCovRoutineActive) {
-      beam_shift_delta = GetBeamShiftDelta(true_beam_incidentEnergies);
+      //beam_shift_delta = GetBeamShiftDelta(true_beam_incidentEnergies);
+      beam_shift_delta = GetBeamShiftDelta(true_beam_initEnergy);
 
       double e1 = sqrt(
           std::pow((beam_inst_P + beam_shift_delta)*1.e3, 2) + 139.57*139.57);
@@ -861,8 +1021,8 @@ void protoana::AbsCexDriver::RefillSampleLoop(
     std::vector<double> good_true_incEnergies;
     if (fill_incident) {
       good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     }
 
     int bin = GetBeamBin(beam_energy_bins, (use_beam_inst_P ? beam_inst_P :
@@ -873,6 +1033,7 @@ void protoana::AbsCexDriver::RefillSampleLoop(
     if ((fBeamShiftCovRoutineActive ||
          fRestrictBeamInstP)
         && bin == -1) {
+      //std::cout << "Skipping beam bin " << beam_inst_P << std::endl;
       continue;
     }
     //int bin = GetBeamBin(beam_energy_bins, (use_beam_inst_P ? beam_inst_P :
@@ -984,38 +1145,39 @@ void protoana::AbsCexDriver::RefillSampleLoop(
     else if (reco_beam_incidentEnergies.size()) {
 
       double energy[1] = {0.};
-      /*if (syst_pars.find("dEdX_Cal") != syst_pars.end()) {
-        energy[0] = sqrt(beam_inst_P*beam_inst_P*1.e6 + 139.57*139.57) -
-                        139.57;
-        //limits?
-        for (size_t k = 0; k < calibrated_dQdX.size()-1; ++k) {
-          if ((calibrated_dQdX)[k] < 0.) continue;
-
-          double dedx = (1./(syst_pars.at("dEdX_Cal").GetValue()));
-          dedx *= (calibrated_dQdX)[k];
-          dedx *= (fBetaP / ( fRho * (beam_EField)[k] ) * fWion);
-          dedx = exp(dedx);
-          dedx -= fAlpha;
-          dedx *= ((fRho*(beam_EField)[k])/fBetaP);
-
-          if (dedx*(track_pitch)[k] > fEnergyFix)
-            continue;
-          energy[0] -= dedx*(track_pitch)[k];
-        }
-      }
-
-      else {*/
+      if (fFakeResolution < 0) {
         energy[0] = {reco_beam_interactingEnergy + beam_energy_delta};
         if (fDoEnergyFix) {
           for (size_t k = 1; k < reco_beam_incidentEnergies.size(); ++k) {
             double deltaE = ((reco_beam_incidentEnergies)[k-1] -
                              (reco_beam_incidentEnergies)[k]);
-            if (deltaE > fEnergyFix) {
-              energy[0] += deltaE; 
+            if (fVaryCalibrationFakeData && fFillFakeDataInMain) {
+              energy[0] += deltaE;
+              if (deltaE*fDataCalibrationFactor < fEnergyFix) {
+                energy[0] -= deltaE*fDataCalibrationFactor;
+              }
+            }
+            else {
+              if (deltaE > fEnergyFix) {
+                energy[0] += deltaE; 
+              }
             }
           }
         }
-      //}
+      }
+      else {
+        //std::cout << "Using fake res: " << fFakeResolution << std::endl;
+        if (fUseStoredEnergies) {
+          energy[0] = fStoredEnergies[worker_id][energy_index]; 
+          //std::cout << "Used stored energy " << energy[0] << std::endl;
+          ++energy_index;
+        }
+        else {
+          energy[0] = fRNG.Gaus(end_energy, fFakeResolution);
+          fStoredEnergies[worker_id].push_back(energy[0]);
+          //std::cout << "Storing " << energy[0] << std::endl;
+        }
+      }
 
       if (selected_hist->FindBin(energy[0]) == 0) {
         val[0] = selected_hist->GetBinCenter(1);
@@ -1031,12 +1193,30 @@ void protoana::AbsCexDriver::RefillSampleLoop(
       val[0] = selected_hist->GetBinCenter(1);
     }
 
-    if (fSystematics) 
+    //std::cout << "Weights: " << weight << std::endl;
+    //if (fSystematics) {
+    if (syst_pars.size()) {
       weight *= fSystematics->GetEventWeight(event, signal_index, syst_pars);
+      //std::cout << "\tAfter systs: " << weight << std::endl;
+    }
+
+    //if (fG4RWPars) {
+    if (g4rw_pars.size()) {
+      //weight *= fG4RWPars->GetEventWeight(event, signal_index, g4rw_pars);
+      weight *= fSystematics->GetSignalWeight_G4RWCoeffNoPar(event, signal_index);
+      weight *= fSystematics->GetSignalWeight_TiedG4RWCoeffNoPar(event, signal_index);
+      //std::cout << "\tAfter g4rw: " << weight << std::endl;
+    }
 
     if (fix_factors != 0x0) {
       int bin = fix_factors->at(new_selection)->FindBin(val[0]);
       weight *= fix_factors->at(new_selection)->GetBinContent(bin);
+      //std::cout << "\tAfter fix: " << weight << std::endl;
+    }
+
+    if (fFillFakeDataInMain) {
+      weight *= FakeDataWeight(event);
+      //std::cout << "\tAfter fake: " << weight << std::endl;
     }
 
     //HERE ADD THE VARIED STATS weight
@@ -1046,21 +1226,30 @@ void protoana::AbsCexDriver::RefillSampleLoop(
       weight *= this_sample->GetStatVarWeight(new_selection, val[0]);
     }
 
+    if (fUseMCStatVarWeight) {
+      //std::cout << event.GetMCStatVarWeight() << std::endl;
+      weight *= event.GetMCStatVarWeight();
+    }
+
     std::lock_guard<std::mutex> guard(fRefillMutex);
     this_sample->FillSelectionHist(new_selection, val, weight);
     //Fill the total incident hist with truth info
     if (fill_incident) {
       //this_sample->FillTrueIncidentHist(good_true_incEnergies, weight);
       this_sample->AddIncidentEnergies(good_true_incEnergies, weight);
-      if (true_beam_incidentEnergies.size() > 0) {
+      /*if (true_beam_incidentEnergies.size() > 0) {
       this_sample->AddESliceEnergies(
           {(true_beam_incidentEnergies)[0],
            end_energy}, weight);
-      }
+      }*/
     }
     this_sample->AddVariedFlux(weight);
+
+    FillExtraHistsMC(*this_sample, event, weight);
   }
 }
+
+
 
 void protoana::AbsCexDriver::RefillMCSamples(
     const std::vector<ThinSliceEvent> & events,
@@ -1070,6 +1259,7 @@ void protoana::AbsCexDriver::RefillMCSamples(
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P,
     bool fill_incident, std::map<int, TH1 *> * fix_factors) {
 
@@ -1108,7 +1298,7 @@ void protoana::AbsCexDriver::RefillMCSamples(
   for (auto workerid : ROOT::TSeqI(fNWorkers)) {
     std::thread worker(&AbsCexDriver::RefillSampleLoop, this,
         std::ref(events), std::ref(samples), std::ref(signal_sample_checks), std::ref(beam_energy_bins),
-        std::ref(signal_pars), std::ref(flux_pars), std::ref(syst_pars), fit_under_over,
+        std::ref(signal_pars), std::ref(flux_pars), std::ref(syst_pars), std::ref(g4rw_pars), fit_under_over,
         tie_under_over, use_beam_inst_P, fill_incident, fix_factors,
         workerid, events_split);
     workers.emplace_back(std::move(worker));
@@ -1120,6 +1310,7 @@ void protoana::AbsCexDriver::RefillMCSamples(
   }
 
   for (auto &&worker : workers) { worker.join();}
+  if (fFakeResolution > 0. && !fUseStoredEnergies) fUseStoredEnergies = true; //turn this on so that every time after the first, the same energy is used
   //Threading ideas:
   //see https://root.cern/doc/master/mt304__fillHistos_8C.html
   //and https://root.cern/doc/master/mt201__parallelHistoFill_8C.html
@@ -1349,14 +1540,21 @@ void protoana::AbsCexDriver::SetupSysts(
     const std::map<int, bool> & signal_sample_checks,
     std::vector<double> & beam_energy_bins,
     const std::map<std::string, ThinSliceSystematic> & pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     TFile & output_file) {
   fSystematics = new PDSPSystematics(events, samples, signal_sample_checks,
-                                     beam_energy_bins, pars, output_file,
+                                     beam_energy_bins, pars, g4rw_pars, output_file,
                                      (!fInclusive ? 4 : 2), //Upstream
                                      (!fInclusive ? 6 : 4), (!fInclusive ? 7 : 5), //NoTrack, Decay 
                                      (!fInclusive ? 6 : 4), (!fInclusive? 5 : 3), //Past FV, BeamCut
                                      (!fInclusive ? 4 : 2));//Past FV Selection ID
  
+  /*fG4RWPars = new PDSPSystematics(events, samples, signal_sample_checks,
+                                  beam_energy_bins, g4rw_pars, output_file,
+                                  (!fInclusive ? 4 : 2), //Upstream
+                                  (!fInclusive ? 6 : 4), (!fInclusive ? 7 : 5), //NoTrack, Decay 
+                                  (!fInclusive ? 6 : 4), (!fInclusive? 5 : 3), //Past FV, BeamCut
+                                  (!fInclusive ? 4 : 2));//Past FV Selection ID*/
 }
 
 /*
@@ -1778,14 +1976,14 @@ double protoana::AbsCexDriver::GetSystWeight_BeamEffs(
 }*/
 
 double protoana::AbsCexDriver::GetFakeWeight_G4RWCoeff(
-    const ThinSliceEvent & event,
+    const ThinSliceEvent & event/*,
     const std::vector<std::string> & branches,
-    const std::vector<double> & vars) {
+    const std::vector<double> & vars*/) {
   double weight = 1.;
 
-  for (size_t i = 0; i < vars.size(); ++i) {
+  for (size_t i = 0; i < fG4RWVars.size(); ++i) {
     weight *= event.GetG4RWCoeffWeight(
-        branches[i], vars[i]);
+        fG4RWBranches[i], fG4RWVars[i]);
   }
   return weight;
 }
@@ -1940,13 +2138,298 @@ double protoana::AbsCexDriver::GetSystWeight_BeamShift2D(
   return weight;//fSystBeamShiftMap->Interpolate(x_val, y_val);
 }*/
 
+
+void protoana::AbsCexDriver::SetupExtraHists(
+    ThinSliceDataSet & data_set, 
+    std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
+    std::map<int, std::vector<std::vector<ThinSliceSample>>> & fake_samples) {
+
+  data_set.SetupExtraHists(fExtraHistSets);
+
+  /*for (auto & hist_set : fExtraHistSets) {
+    std::string category = hist_set.get<std::string>("Category");
+    fActiveExtraHistsData.push_back({category, fStoredExtraHistsData[category]});
+    fActiveExtraHistsMC.push_back({category, fStoredExtraHistsMC[category]});
+  }*/
+
+  for (auto & hist_set : fExtraHistSets) {
+    std::string category = hist_set.get<std::string>("Category");
+    if (category == "EndZ") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataEndZ});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCEndZ});
+    }
+    if (category == "EndZGoodReco") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataEndZGoodReco});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCEndZGoodReco});
+    }
+    if (category == "StartX") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataStartX});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCStartX});
+      auto options = hist_set.get<fhicl::ParameterSet>("Options");
+      fStartXDataMean = options.get<double>("DataMean", 0.);
+      fStartXMCMean = options.get<double>("MCMean", 0.);
+      fStartXDataSigma = options.get<double>("DataSigma", 0.);
+      fStartXMCSigma = options.get<double>("MCSigma", 0.);
+    }
+    if (category == "StartY") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataStartY});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCStartY});
+      auto options = hist_set.get<fhicl::ParameterSet>("Options");
+      fStartYDataMean = options.get<double>("DataMean", 0.);
+      fStartYMCMean = options.get<double>("MCMean", 0.);
+      fStartYDataSigma = options.get<double>("DataSigma", 0.);
+      fStartYMCSigma = options.get<double>("MCSigma", 0.);
+    }
+    if (category == "StartZ") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataStartZ});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCStartZ});
+      auto options = hist_set.get<fhicl::ParameterSet>("Options");
+      fStartZDataMean = options.get<double>("DataMean", 0.);
+      fStartZMCMean = options.get<double>("MCMean", 0.);
+      fStartZDataSigma = options.get<double>("DataSigma", 0.);
+      fStartZMCSigma = options.get<double>("MCSigma", 0.);
+    }
+    else if (category == "VertexMichel") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataVertexMichel});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCVertexMichel});
+    }
+    else if (category == "TrackScore") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataTrackScore});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCTrackScore});
+    }
+    else if (category == "Trunc_dEdX") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataTrunc_dEdX});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCTrunc_dEdX});
+    }
+    else if (category == "Chi2PerHit") {
+      fActiveExtraHistsData.push_back({category, FillExtraHistDataChi2PerHit});
+      fActiveExtraHistsMC.push_back({category, FillExtraHistMCChi2PerHit});
+    }
+  }
+
+  for (auto & it : samples) {
+    int i = 0;
+    for (auto & sample_vec : it.second) {
+      int j = 0;
+      for (auto & sample : sample_vec) {
+        sample.SetupExtraHists(fExtraHistSets, i, j);
+        ++j;
+      }
+      ++i;
+    }
+  }
+  for (auto & it : fake_samples) {
+    int i = 0;
+    for (auto & sample_vec : it.second) {
+      int j = 0;
+      for (auto & sample : sample_vec) {
+        sample.SetupExtraHists(fExtraHistSets, i, j);
+        ++j;
+      }
+      ++i;
+    }
+  }
+}
+
+void protoana::AbsCexDriver::FillExtraHistDataEndZ(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  std::string category = "EndZ";
+  data_set.FillExtraHist(category, vars.reco_endz);
+}
+void protoana::AbsCexDriver::FillExtraHistDataEndZGoodReco(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+
+  //Skip bad-reco events
+  if (vars.selection_ID == 5 || vars.selection_ID == 6) return;
+
+  std::string category = "EndZGoodReco";
+  data_set.FillExtraHist(category, vars.reco_endz);
+}
+
+void protoana::AbsCexDriver::FillExtraHistDataStartX(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  std::string category = "StartX";
+  double val = (vars.reco_startx_sce - fStartXDataMean)/fStartXDataSigma;
+  data_set.FillExtraHist(category, val);
+}
+void protoana::AbsCexDriver::FillExtraHistDataStartY(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  std::string category = "StartY";
+  double val = (vars.reco_starty_sce - fStartYDataMean)/fStartYDataSigma;
+  data_set.FillExtraHist(category, val);
+}
+void protoana::AbsCexDriver::FillExtraHistDataStartZ(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  std::string category = "StartZ";
+  double val = (vars.reco_startz_sce - fStartZDataMean)/fStartZDataSigma;
+  data_set.FillExtraHist(category, val);
+}
+
+void protoana::AbsCexDriver::FillExtraHistDataTrackScore(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  //Skip non-interaction selected events
+  if (vars.selection_ID > 3) return;
+
+  std::string category = "TrackScore";
+  for (auto & score : vars.reco_product_track_scores)
+    data_set.FillExtraHist(category, score);
+}
+
+void protoana::AbsCexDriver::FillExtraHistDataVertexMichel(ThinSliceDataSet & data_set,
+                                               const ExtraHistDataVars & vars) {
+  if (vars.selection_ID > 3 && vars.selection_ID < 7) return;
+
+  std::string category = "VertexMichel";
+  if (vars.vertex_nhits == 0) {
+    auto * h = (TH1D*)data_set.GetExtraHist(category);
+    h->AddBinContent(1);
+  }
+  else {
+    data_set.FillExtraHist(category,
+                           vars.vertex_michel_score/vars.vertex_nhits);
+  }
+}
+void protoana::AbsCexDriver::FillExtraHistDataTrunc_dEdX(
+    ThinSliceDataSet & data_set, const ExtraHistDataVars & vars) {
+  //Skip non-interaction selected events
+  if (vars.selection_ID > 3) return;
+
+  std::string category = "Trunc_dEdX";
+  for (auto & val : vars.reco_product_truncated_dEdXs)
+    data_set.FillExtraHist(category, val);
+}
+
+void protoana::AbsCexDriver::FillExtraHistDataChi2PerHit(
+    ThinSliceDataSet & data_set, const ExtraHistDataVars & vars) {
+  //Skip non-interaction selected events
+  if (vars.selection_ID > 3) return;
+
+  std::string category = "Chi2PerHit";
+  for (size_t i = 0; i < vars.reco_product_chi2s_per_hit.size(); ++i) {
+    double trunc_dedx = vars.reco_product_truncated_dEdXs[i];
+    if (((trunc_dedx < 0.5) || (trunc_dedx > 2.8 && trunc_dedx < 3.4)) &&
+        (vars.reco_product_chi2s_per_hit[i] > 0)) {
+      data_set.FillExtraHist(category, vars.reco_product_chi2s_per_hit[i]);
+    }
+  }
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCEndZ(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  std::string category = "EndZ";
+  sample.FillExtraHist(category, event.GetRecoEndZ(), weight);
+}
+void protoana::AbsCexDriver::FillExtraHistMCEndZGoodReco(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  if (event.GetSelectionID() == 5 || event.GetSelectionID() == 6) return;
+
+  std::string category = "EndZGoodReco";
+  sample.FillExtraHist(category, event.GetRecoEndZ(), weight);
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCStartX(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  std::string category = "StartX";
+  double val = (event.GetRecoStartX_SCE() - fStartXMCMean)/fStartXMCSigma;
+  sample.FillExtraHist(category, val, weight);
+}
+void protoana::AbsCexDriver::FillExtraHistMCStartY(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  std::string category = "StartY";
+  double val = (event.GetRecoStartY_SCE() - fStartYMCMean)/fStartYMCSigma;
+  sample.FillExtraHist(category, val, weight);
+}
+void protoana::AbsCexDriver::FillExtraHistMCStartZ(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  std::string category = "StartZ";
+  double val = (event.GetRecoStartZ_SCE() - fStartZMCMean)/fStartZMCSigma;
+  sample.FillExtraHist(category, val, weight);
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCTrackScore(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  if (event.GetSelectionID() > 3) return;
+
+  std::string category = "TrackScore";
+  for (auto & score : event.GetRecoDaughterTrackScores())
+    sample.FillExtraHist(category, score, weight);
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCVertexMichel(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  if (event.GetSelectionID() > 3 && event.GetSelectionID() < 7) return;
+
+  std::string category = "VertexMichel";
+  if (event.GetVertexNHits() == 0) {
+    auto * h = (TH1D*)sample.GetExtraHist(category);
+    h->AddBinContent(1, weight);
+  }
+  else {
+    sample.FillExtraHist(
+        category,
+        event.GetVertexMichelScore()/event.GetVertexNHits(),
+        weight);
+  }
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCTrunc_dEdX(ThinSliceSample & sample,
+                                                 const ThinSliceEvent & event,
+                                                 double weight) {
+  if (event.GetSelectionID() > 3) return;
+
+  std::string category = "Trunc_dEdX";
+  for (auto & val : event.GetTrunc_dEdXs())
+    sample.FillExtraHist(category, val, weight);
+}
+
+void protoana::AbsCexDriver::FillExtraHistMCChi2PerHit(ThinSliceSample & sample,
+                                                       const ThinSliceEvent & event,
+                                                       double weight) {
+  if (event.GetSelectionID() > 3) return;
+
+  std::string category = "Chi2PerHit";
+  auto & truncated_dEdXs = event.GetTrunc_dEdXs();
+  auto & chi2s_per_hit = event.GetChi2sPerHit();
+  for (size_t i = 0; i < chi2s_per_hit.size(); ++i) {
+    double trunc_dedx = truncated_dEdXs[i];
+    if (((trunc_dedx < 0.5) || (trunc_dedx > 2.8 && trunc_dedx < 3.4))
+        && (chi2s_per_hit[i] > 0)) {
+      sample.FillExtraHist(category, chi2s_per_hit[i], weight);
+    }
+  }
+}
+
+void protoana::AbsCexDriver::FillExtraHistsData(ThinSliceDataSet & data_set,
+                                            const ExtraHistDataVars & vars) {
+  for (auto & filler : fActiveExtraHistsData) {
+    filler.second(data_set, vars);
+  }
+}
+
+void protoana::AbsCexDriver::FillExtraHistsMC(ThinSliceSample & sample,
+                                              const ThinSliceEvent & event,
+                                              double weight) {
+  for (auto & filler : fActiveExtraHistsMC) {
+    //std::cout << "Filling extra " << filler.first << std::endl;
+    filler.second(sample, event, weight);
+  }
+}
+
 void protoana::AbsCexDriver::BuildDataHists(
     TTree * tree, ThinSliceDataSet & data_set, double & flux,
     const std::vector<double> & beam_energy_bins,
     std::vector<double> & beam_fluxes,
     int split_val) {
   int selection_ID; 
-  double reco_beam_interactingEnergy, reco_beam_endZ;
+  double reco_beam_interactingEnergy, reco_beam_endZ,
+         reco_beam_startX, reco_beam_startY, reco_beam_startZ;
   std::vector<double> * reco_beam_incidentEnergies = 0x0;
   if (!fInclusive) {
     tree->SetBranchAddress("selection_ID", &selection_ID);
@@ -1957,13 +2440,40 @@ void protoana::AbsCexDriver::BuildDataHists(
   tree->SetBranchAddress("reco_beam_interactingEnergy",
                         &reco_beam_interactingEnergy);
   tree->SetBranchAddress("reco_beam_endZ", &reco_beam_endZ);
+  tree->SetBranchAddress("reco_beam_calo_startX", &reco_beam_startX);
+  tree->SetBranchAddress("reco_beam_calo_startY", &reco_beam_startY);
+  tree->SetBranchAddress("reco_beam_calo_startZ", &reco_beam_startZ);
   tree->SetBranchAddress("reco_beam_incidentEnergies",
                         &reco_beam_incidentEnergies);
+  double vertex_michel_score;
+  int vertex_nhits;
+  tree->SetBranchAddress("reco_beam_vertex_michel_score", &vertex_michel_score);
+  tree->SetBranchAddress("reco_beam_vertex_nHits", &vertex_nhits);
   double beam_inst_P;
   tree->SetBranchAddress("beam_inst_P", &beam_inst_P);
 
+  std::vector<double> * reco_daughter_track_scores = 0x0;
+  tree->SetBranchAddress("reco_daughter_PFP_trackScore_collection",
+                         &reco_daughter_track_scores);
+
+  std::vector<double> * reco_daughter_truncated_dEdXs = 0x0,
+                      * reco_daughter_chi2s = 0x0;
+  tree->SetBranchAddress("reco_daughter_allTrack_truncLibo_dEdX_pos",
+                         &reco_daughter_truncated_dEdXs);
+  tree->SetBranchAddress("reco_daughter_allTrack_Chi2_proton",
+                         &reco_daughter_chi2s);
+
+  std::vector<int> * reco_daughter_chi2_nhits = 0x0;
+  tree->SetBranchAddress("reco_daughter_allTrack_Chi2_ndof",
+                         &reco_daughter_chi2_nhits);
+
+  //SetupExtraHists(data_set);
+  //data_set.SetupExtraHists(fExtraHistSets);
+
   TH1D & incident_hist = data_set.GetIncidentHist();
   std::map<int, TH1 *> & selected_hists = data_set.GetSelectionHists();
+  auto & beam_bin_selected_hists
+      = data_set.GetBeamBinSelectionHists();
 
   if (split_val < 0 || split_val > tree->GetEntries()) {
     flux = tree->GetEntries()/* - split_val*/;
@@ -1993,6 +2503,29 @@ void protoana::AbsCexDriver::BuildDataHists(
                sqrt(std::pow(beam_inst_P*1.e3, 2) + pi_mass_sq);
     //std::cout << "deltaE_scale: " << deltaE_scale << std::endl; 
     beam_fluxes[beam_bin] += 1.;
+
+    auto & beam_bin_sel_hist = beam_bin_selected_hists[selection_ID];
+
+    ExtraHistDataVars extra_vars(selection_ID, reco_beam_endZ,
+                                 reco_beam_startX, reco_beam_startY,
+                                 reco_beam_startZ, vertex_michel_score,
+                                 vertex_nhits);
+    extra_vars.AddRecoProductTrackScores((*reco_daughter_track_scores));
+    extra_vars.AddRecoProductTrunc_dEdXs((*reco_daughter_truncated_dEdXs));
+
+    auto chi2_vec = (*reco_daughter_chi2s);
+    for (size_t j = 0; j < chi2_vec.size(); ++j) {
+      int nhits = (*reco_daughter_chi2_nhits)[j];
+      if (nhits > 0) {
+        chi2_vec[j] /= nhits;
+      }
+      else {
+        chi2_vec[j] = -999.;
+      }
+    } 
+    extra_vars.AddRecoProductChi2sPerHit(chi2_vec);
+
+    FillExtraHistsData(data_set, extra_vars);
 
     double val = 0.;
     if (std::find(fEndZSelections.begin(), fEndZSelections.end(), selection_ID)
@@ -2058,6 +2591,7 @@ void protoana::AbsCexDriver::BuildDataHists(
     }
 
     selected_hists[selection_ID]->Fill(val);
+    beam_bin_sel_hist->Fill(val, 1.e3*beam_inst_P_scaled);
   }
   std::cout << "Data -- Skipped: " << n_skipped << std::endl;
   flux -= n_skipped;
@@ -2074,52 +2608,57 @@ void protoana::AbsCexDriver::BuildFakeData(
     std::vector<double> & beam_energy_bins,
     std::vector<double> & beam_fluxes,
     int split_val, bool scale_to_data_beam_p) {
-  std::string routine = fExtraOptions.get<std::string>("FakeDataRoutine");
-  if (routine == "SampleScales") {
+  //std::string routine = fExtraOptions.get<std::string>("FakeDataRoutine");
+  if (fFakeDataRoutine == "SampleScales") {
     FakeDataSampleScales(events, samples, signal_sample_checks, data_set, flux,
                          sample_scales, beam_energy_bins, beam_fluxes,
                          split_val, scale_to_data_beam_p);
   }
-  else if (routine == "G4RWGrid") {
+  else if (fFakeDataRoutine == "G4RWGrid") {
     FakeDataG4RWGrid(events, samples, signal_sample_checks, data_set, flux,
                  sample_scales, beam_energy_bins, beam_fluxes,
                  split_val, scale_to_data_beam_p);
   }
-  else if (routine == "EffVar") {
+  else if (fFakeDataRoutine == "EffVar") {
     FakeDataEffVar(events, samples, signal_sample_checks, data_set, flux,
                  sample_scales, split_val);
   }
-  else if (routine == "LowP") {
+  else if (fFakeDataRoutine == "LowP") {
     FakeDataLowP(events, samples, signal_sample_checks, data_set, flux,
                  sample_scales, split_val);
   }
-  else if (routine == "BinnedScales") {
+  else if (fFakeDataRoutine == "BinnedScales") {
     FakeDataBinnedScales(tree, samples, signal_sample_checks, data_set, flux,
                          sample_scales, split_val);
   }
-  else if (routine == "dEdX") {
+  else if (fFakeDataRoutine == "dEdX") {
     FakeDatadEdX(tree, samples, signal_sample_checks, data_set, flux,
                  sample_scales, split_val);
   }
-  else if (routine == "PionAngle") {
+  else if (fFakeDataRoutine == "PionAngle") {
     FakeDataPionAngle(tree, samples, signal_sample_checks, data_set, flux,
                       sample_scales, split_val);
   }
-  else if (routine == "AngleVar") {
+  else if (fFakeDataRoutine == "AngleVar") {
     FakeDataAngleVar(events/*tree*/, samples, signal_sample_checks, data_set, flux,
                      beam_energy_bins, beam_fluxes,
                      sample_scales, split_val, scale_to_data_beam_p);
   }
-  else if (routine == "BeamWeight") {
+  else if (fFakeDataRoutine == "BeamWeight") {
     FakeDataBeamWeight(events, samples, signal_sample_checks, data_set, flux,
                       sample_scales, split_val);
   }
-  else if (routine == "BeamScale") {
+  else if (fFakeDataRoutine == "BeamScale") {
     std::cout << "Beam scale" << std::endl;
     FakeDataBeamScale(events, samples, signal_sample_checks, data_set, flux,
                       beam_energy_bins, beam_fluxes,
                       sample_scales, split_val, scale_to_data_beam_p);
   }
+  /*else if (fFakeDataRoutine == "SetResolution") {
+    FakeDataSetResolution(events, samples, signal_sample_checks, data_set, flux,
+                     beam_energy_bins, beam_fluxes,
+                     sample_scales, split_val, scale_to_data_beam_p);
+  }*/
 }
 
 void protoana::AbsCexDriver::FakeDataSampleScales(
@@ -2164,14 +2703,14 @@ void protoana::AbsCexDriver::FakeDataSampleScales(
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
     int sample_ID = event.GetSampleID();
     int selection_ID = event.GetSelectionID();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
     const std::vector<double> & reco_beam_incidentEnergies
         = event.GetRecoIncidentEnergies();
     double reco_beam_interactingEnergy = event.GetRecoInteractingEnergy();
     double reco_beam_endZ = event.GetRecoEndZ();
     double beam_P = event.GetBeamInstP();
-    const std::vector<int> & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<int> & true_beam_slices = event.GetTrueSlices();
 
     //double end_energy = true_beam_interactingEnergy;
     if (fSliceMethod == "Traj") {
@@ -2302,8 +2841,8 @@ void protoana::AbsCexDriver::FakeDataSampleScales(
 
     selected_hists[selection_ID]->Fill(val, scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddVariedFlux(scale);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
     if (norm_to_data_beam_P) {
@@ -2348,7 +2887,7 @@ void protoana::AbsCexDriver::FakeDataBinnedScales(
   std::vector<double> * reco_beam_incidentEnergies = 0x0,
                       * true_beam_traj_KE = 0x0,
                       * true_beam_traj_Z = 0x0;
-  std::vector<int>    * true_beam_slices = 0x0;
+  //std::vector<int>    * true_beam_slices = 0x0;
   double reco_beam_endZ;
   tree->SetBranchAddress("reco_beam_endZ", &reco_beam_endZ);
   tree->SetBranchAddress("new_interaction_topology", &sample_ID);
@@ -2357,15 +2896,15 @@ void protoana::AbsCexDriver::FakeDataBinnedScales(
                          &true_beam_interactingEnergy);
   tree->SetBranchAddress("true_beam_endP", &true_beam_endP);
   tree->SetBranchAddress("true_beam_traj_KE", &true_beam_traj_KE);
-  tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
+  //tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
   tree->SetBranchAddress("true_beam_traj_Z", &true_beam_traj_Z);
   tree->SetBranchAddress("reco_beam_interactingEnergy",
                          &reco_beam_interactingEnergy);
   tree->SetBranchAddress("reco_beam_incidentEnergies",
                          &reco_beam_incidentEnergies);
-  std::vector<double> * true_beam_incidentEnergies = 0x0;
-  tree->SetBranchAddress("true_beam_incidentEnergies",
-                         &true_beam_incidentEnergies);
+  //std::vector<double> * true_beam_incidentEnergies = 0x0;
+  //tree->SetBranchAddress("true_beam_incidentEnergies",
+  //                       &true_beam_incidentEnergies);
 
   TH1D & incident_hist = data_set.GetIncidentHist();
   std::map<int, TH1 *> & selected_hists = data_set.GetSelectionHists();
@@ -2510,8 +3049,8 @@ void protoana::AbsCexDriver::FakeDataBinnedScales(
 
     selected_hists[selection_ID]->Fill(val, scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        *true_beam_traj_Z, *true_beam_traj_KE, *true_beam_slices,
-        *true_beam_incidentEnergies);
+        *true_beam_traj_Z, *true_beam_traj_KE/*, *true_beam_slices,
+        *true_beam_incidentEnergies*/);
     this_sample->AddVariedFlux(scale);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
   }
@@ -2535,6 +3074,28 @@ void protoana::AbsCexDriver::FakeDataBinnedScales(
   }
 }
 
+
+void protoana::AbsCexDriver::SetupFakeDataG4RW() {
+  //Build the map for fake data scales
+  fhicl::ParameterSet g4rw_options 
+      = fExtraOptions.get<fhicl::ParameterSet>("FakeDataG4RWGrid");
+
+  std::string branch = g4rw_options.get<std::string>("Branch");
+
+  std::vector<size_t> g4rw_pos = g4rw_options.get<std::vector<size_t>>("Position");
+  fG4RWVars = g4rw_options.get<std::vector<double>>("Var", {});
+
+  //std::vector<std::string> branches;
+  if (g4rw_options.get<bool>("SingleBranch")) {
+    fG4RWBranches.push_back(branch);
+  }
+  else {
+    for (size_t & i : g4rw_pos) {
+      fG4RWBranches.push_back(branch + "_" + std::to_string(i));
+    }
+  }
+
+}
 
 void protoana::AbsCexDriver::FakeDataG4RWGrid(
     const std::vector<ThinSliceEvent> & events,
@@ -2596,9 +3157,9 @@ void protoana::AbsCexDriver::FakeDataG4RWGrid(
     double reco_beam_endZ = event.GetRecoEndZ();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int> & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int> & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
     double beam_P = event.GetBeamInstP();
 
 
@@ -2632,7 +3193,7 @@ void protoana::AbsCexDriver::FakeDataG4RWGrid(
       }
     }
     else {
-      scale *= GetFakeWeight_G4RWCoeff(event, branches, g4rw_var);
+      scale *= GetFakeWeight_G4RWCoeff(event/*, branches, g4rw_var*/);
     }
     }
 
@@ -2744,8 +3305,8 @@ void protoana::AbsCexDriver::FakeDataG4RWGrid(
     this_sample->AddVariedFlux(scale);
     this_sample->FillSelectionHist(selection_ID, val, scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
     if (norm_to_data_beam_P) {
       beam_fluxes[GetBeamBin(beam_energy_bins, beam_P)] += scale;
@@ -2840,13 +3401,13 @@ void protoana::AbsCexDriver::FakeDataPionAngle(
                          &reco_beam_incidentEnergies);
   std::vector<double> * true_beam_traj_Z = 0x0,
                       * true_beam_traj_KE = 0x0;
-  std::vector<int>    * true_beam_slices = 0x0;
+  //std::vector<int>    * true_beam_slices = 0x0;
   tree->SetBranchAddress("true_beam_traj_Z", &true_beam_traj_Z);
   tree->SetBranchAddress("true_beam_traj_KE", &true_beam_traj_KE);
-  tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
-  std::vector<double> * true_beam_incidentEnergies = 0x0;
-  tree->SetBranchAddress("true_beam_incidentEnergies",
-                         &true_beam_incidentEnergies);
+  //tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
+  //std::vector<double> * true_beam_incidentEnergies = 0x0;
+  //tree->SetBranchAddress("true_beam_incidentEnergies",
+  //                       &true_beam_incidentEnergies);
 
   TH1D & incident_hist = data_set.GetIncidentHist();
   std::map<int, TH1 *> & selected_hists = data_set.GetSelectionHists();
@@ -3025,8 +3586,8 @@ void protoana::AbsCexDriver::FakeDataPionAngle(
     selected_hists[selection_ID]->Fill(val, scale);
     this_sample->AddVariedFlux(scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        *true_beam_traj_Z, *true_beam_traj_KE, *true_beam_slices,
-        *true_beam_incidentEnergies);
+        *true_beam_traj_Z, *true_beam_traj_KE/*, *true_beam_slices,
+        *true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
   }
 
@@ -3116,9 +3677,9 @@ void protoana::AbsCexDriver::FakeDataAngleVar(
         = event.GetTrueDaughterPDGs();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int> & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int> & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
     double leading_costheta = 0.;
     if (check_PDG == 2212) {
       leading_costheta = event.GetLeadingPCostheta();
@@ -3284,18 +3845,20 @@ void protoana::AbsCexDriver::FakeDataAngleVar(
     this_sample->FillSelectionHist(selection_ID, val, scale);
     this_sample->AddVariedFlux(scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
     if (norm_to_data_beam_P) {
       beam_fluxes[beam_bin] += scale;
     }
   }
 
+  /* mean is set but not used
   double mean = 0.;
   for (auto s : all_scales) mean += s;
   mean /= all_scales.size();
   //std::cout << "Mean scale: " << mean << std::endl;
+  */
 
   for (auto it = sample_scales.begin(); it != sample_scales.end(); ++it) {
     for (size_t i = 0; i < it->second.size(); ++i) {
@@ -3315,6 +3878,195 @@ void protoana::AbsCexDriver::FakeDataAngleVar(
   }
   ScaleSamples(samples, flux/new_flux);
 }
+
+
+/*void protoana::AbsCexDriver::FakeDataSetResolution(
+    const std::vector<ThinSliceEvent> & events,
+    std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
+    const std::map<int, bool> & signal_sample_checks,
+    ThinSliceDataSet & data_set, double & flux,
+    const std::vector<double> & beam_energy_bins,
+    std::vector<double> & beam_fluxes,
+    std::map<int, std::vector<double>> & sample_scales, int split_val,
+    bool norm_to_data_beam_P) {
+ 
+  fhicl::ParameterSet options 
+      = fExtraOptions.get<fhicl::ParameterSet>("FakeDataSetResolution");
+  double resolution = options.get<double>("Resolution");
+
+  //TH1D & incident_hist = data_set.GetIncidentHist();
+  std::map<int, TH1 *> & selected_hists = data_set.GetSelectionHists();
+
+  for (size_t i = 0; i < beam_energy_bins.size()-1; ++i) {beam_fluxes.push_back(0.);}
+
+  std::map<int, std::vector<TH1D *>> ratios;
+  for (int i = 1; i < 4; ++i) {
+    ratios[i] = std::vector<TH1D *>();
+    for (auto n : ratio_names[i]) {
+      std::string name = n + "_" + std::to_string(i);
+      ratios[i].push_back((TH1D*)ratio_file->Get(name.c_str()));
+      //std::cout << i << " " << name << " " << ratios[i].back() << std::endl;
+    }
+  }
+
+  double new_flux = 0.;
+  flux = events.size();
+  
+
+  std::map<int, std::vector<double>> nominal_samples;
+  for (auto it = sample_scales.begin(); it != sample_scales.end(); ++it) {
+    nominal_samples[it->first] = std::vector<double>(it->second.size(), 0.);
+  }
+
+  for (size_t i = 0; i < events.size(); ++i) {
+    const ThinSliceEvent & event = events.at(i);
+    int sample_ID = event.GetSampleID();
+    int selection_ID = event.GetSelectionID();
+    double beam_P = event.GetBeamInstP();
+    double true_beam_interactingEnergy = event.GetTrueInteractingEnergy();
+    double reco_beam_interactingEnergy = event.GetRecoInteractingEnergy();
+    double true_beam_endP = event.GetTrueEndP();
+    const std::vector<double> & reco_beam_incidentEnergies
+        = event.GetRecoIncidentEnergies();
+    double reco_beam_endZ = event.GetRecoEndZ();
+
+    const std::vector<int> & true_beam_daughter_PDG
+        = event.GetTrueDaughterPDGs();
+    const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
+    const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
+    const std::vector<int> & true_beam_slices = event.GetTrueSlices();
+    const std::vector<double> & true_beam_incidentEnergies
+        = event.GetTrueIncidentEnergies();
+    double leading_costheta = 0.;
+    if (check_PDG == 2212) {
+      leading_costheta = event.GetLeadingPCostheta();
+    }
+    else if (check_PDG == 211) {
+      leading_costheta = event.GetLeadingPiPlusCostheta();
+    }
+    else if (check_PDG == 111) {
+      leading_costheta = event.GetLeadingPi0Costheta();
+    }
+
+    if (samples.find(sample_ID) == samples.end())
+      continue;
+
+    double end_energy = true_beam_interactingEnergy;
+    if (fSliceMethod == "Traj") {
+      end_energy = sqrt(true_beam_endP*true_beam_endP*1.e6 + 139.57*139.57) - 139.57;
+    }
+    else if (fSliceMethod == "E") {
+      end_energy = sqrt(true_beam_endP*true_beam_endP*1.e6 + 139.57*139.57) - 139.57;
+    }
+    else if (fSliceMethod == "Alt") {
+      int bin = fEndSlices->GetXaxis()->FindBin(true_beam_traj_Z.back());
+      if (bin > 0) {
+        end_energy = fMeans.at(bin);
+      }
+    }
+
+    double scale = 1.;
+
+    bool is_signal = signal_sample_checks.at(sample_ID);
+    int beam_bin = (norm_to_data_beam_P ?
+                    GetBeamBin(beam_energy_bins, beam_P) : 0);
+    ThinSliceSample * this_sample = 0x0;
+    if (is_signal) {
+      std::vector<ThinSliceSample> & samples_vec = samples[sample_ID][beam_bin];
+      //Get the samples vec from the first beam energy bin
+      bool found = false;
+      for (size_t j = 1; j < samples_vec.size()-1; ++j) {
+        ThinSliceSample & sample = samples_vec.at(j);
+        if (sample.CheckInSignalRange(end_energy)) {     
+          found = true;
+          sample_scales[sample_ID][j] += scale;
+          nominal_samples[sample_ID][j] += 1.;
+          this_sample = &sample;
+          break;
+        }
+      }
+      if (!found) {
+        if (end_energy < samples_vec[1].RangeLowEnd()) {
+          sample_scales[sample_ID][0] += scale;
+          nominal_samples[sample_ID][0] += 1.;
+          this_sample = &samples_vec[0];
+        }
+        else {
+          this_sample = &samples_vec.back();
+          sample_scales[sample_ID].back() += scale;
+          nominal_samples[sample_ID].back() += 1.;
+        }
+      }
+    }
+    else {
+      this_sample = &samples[sample_ID][beam_bin][0];
+      sample_scales[sample_ID][0] += scale;
+      nominal_samples[sample_ID][0] += 1.;
+    }
+
+    new_flux += scale; //1 or scaled
+
+    double val = 0.;
+    if (selection_ID == 4) {
+      if (selected_hists[selection_ID]->FindBin(reco_beam_endZ) == 0) {
+        val = selected_hists[selection_ID]->GetBinCenter(1);
+      }
+      else if (selected_hists[selection_ID]->FindBin(reco_beam_endZ) >
+               selected_hists[selection_ID]->GetNbinsX()) {
+        val = selected_hists[selection_ID]->GetBinCenter(
+            selected_hists[selection_ID]->GetNbinsX());
+      }
+      else {
+        val = reco_beam_endZ;
+      }
+    }
+    else if (selection_ID > 4) {
+      val = .5;
+    }
+    else if (reco_beam_incidentEnergies.size()) {
+      //for (size_t j = 0; j < reco_beam_incidentEnergies.size(); ++j) {
+      //  incident_hist.Fill((reco_beam_incidentEnergies)[j]);
+      //}
+      if (selected_hists.find(selection_ID) != selected_hists.end()) {
+        if (selection_ID < 4) {
+          val = fRNG.Gaus(end_energy, resolution);
+        }
+      }
+    }
+    else {
+      val = selected_hists[selection_ID]->GetBinCenter(1);
+    }
+
+    selected_hists[selection_ID]->Fill(val, scale);
+    this_sample->FillSelectionHist(selection_ID, val, scale);
+    this_sample->AddVariedFlux(scale);
+    std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
+        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
+        true_beam_incidentEnergies);
+    this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
+    if (norm_to_data_beam_P) {
+      beam_fluxes[beam_bin] += scale;
+    }
+  }
+
+  for (auto it = sample_scales.begin(); it != sample_scales.end(); ++it) {
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      if (it->second[i] > 0.) {
+        it->second[i] /= nominal_samples[it->first][i];
+      }
+      else {
+        it->second[i] = 1.;
+      }
+      it->second[i] *= (flux/new_flux);
+    }
+  }
+
+  //incident_hist.Scale(flux/new_flux);
+  for (auto it = selected_hists.begin(); it != selected_hists.end(); ++it) {
+    it->second->Scale(flux/new_flux);
+  }
+  ScaleSamples(samples, flux/new_flux);
+}*/
 
 void protoana::AbsCexDriver::FakeDataBeamWeight(
     const std::vector<ThinSliceEvent> & events,
@@ -3354,9 +4106,9 @@ void protoana::AbsCexDriver::FakeDataBeamWeight(
     double reco_beam_endZ = event.GetRecoEndZ();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int> & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int> & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
     double beam_inst_P = event.GetBeamInstP();
 
 
@@ -3471,8 +4223,8 @@ void protoana::AbsCexDriver::FakeDataBeamWeight(
     selected_hists[selection_ID]->Fill(val, scale);
     this_sample->AddVariedFlux(scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
   }
 
@@ -3547,13 +4299,13 @@ void protoana::AbsCexDriver::FakeDatadEdX(
 
   std::vector<double> * true_beam_traj_Z = 0x0,
                       * true_beam_traj_KE = 0x0;
-  std::vector<int>    * true_beam_slices = 0x0;
+  //std::vector<int>    * true_beam_slices = 0x0;
   tree->SetBranchAddress("true_beam_traj_Z", &true_beam_traj_Z);
   tree->SetBranchAddress("true_beam_traj_KE", &true_beam_traj_KE);
-  tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
-  std::vector<double> * true_beam_incidentEnergies = 0x0;
-  tree->SetBranchAddress("true_beam_incidentEnergies",
-                         &true_beam_incidentEnergies);
+  //tree->SetBranchAddress("true_beam_slices", &true_beam_slices);
+  //std::vector<double> * true_beam_incidentEnergies = 0x0;
+  //tree->SetBranchAddress("true_beam_incidentEnergies",
+  //                       &true_beam_incidentEnergies);
   double true_beam_endP;
   double true_beam_interactingEnergy;
   tree->SetBranchAddress("true_beam_interactingEnergy",
@@ -3651,8 +4403,8 @@ void protoana::AbsCexDriver::FakeDatadEdX(
     }
     this_sample->AddVariedFlux();
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        *true_beam_traj_Z, *true_beam_traj_KE, *true_beam_slices,
-        *true_beam_incidentEnergies);
+        *true_beam_traj_Z, *true_beam_traj_KE/*, *true_beam_slices,
+        *true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies);
 
   }
@@ -3703,9 +4455,9 @@ void protoana::AbsCexDriver::FakeDataEffVar(
     double reco_beam_endZ = event.GetRecoEndZ();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
 
     const std::vector<double> & daughter_Theta
         = event.GetRecoDaughterTrackThetas();
@@ -3801,8 +4553,8 @@ void protoana::AbsCexDriver::FakeDataEffVar(
     }
     this_sample->AddVariedFlux();
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies);
 
     if (selection_ID < 3) {
@@ -3878,9 +4630,9 @@ void protoana::AbsCexDriver::FakeDataLowP(
         = event.GetTrueDaughterPDGs();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
 
     if (samples.find(sample_ID) == samples.end())
       continue;
@@ -4026,8 +4778,8 @@ void protoana::AbsCexDriver::FakeDataLowP(
     selected_hists[selection_ID]->Fill(val, scale);
     this_sample->AddVariedFlux(scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
   }
 
@@ -4104,9 +4856,9 @@ void protoana::AbsCexDriver::FakeDataBeamScale(
     //    = event.GetTrueDaughterPDGs();
     const std::vector<double> & true_beam_traj_Z = event.GetTrueTrajZ();
     const std::vector<double> & true_beam_traj_KE = event.GetTrueTrajKE();
-    const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
-    const std::vector<double> & true_beam_incidentEnergies
-        = event.GetTrueIncidentEnergies();
+    //const std::vector<int>    & true_beam_slices = event.GetTrueSlices();
+    //const std::vector<double> & true_beam_incidentEnergies
+    //    = event.GetTrueIncidentEnergies();
 
     if (samples.find(sample_ID) == samples.end())
       continue;
@@ -4226,8 +4978,8 @@ void protoana::AbsCexDriver::FakeDataBeamScale(
     selected_hists[selection_ID]->Fill(val, scale);
     this_sample->AddVariedFlux(scale);
     std::vector<double> good_true_incEnergies = MakeTrueIncidentEnergies(
-        true_beam_traj_Z, true_beam_traj_KE, true_beam_slices,
-        true_beam_incidentEnergies);
+        true_beam_traj_Z, true_beam_traj_KE/*, true_beam_slices,
+        true_beam_incidentEnergies*/);
     this_sample->AddIncidentEnergies(good_true_incEnergies, scale);
     if (norm_to_data_beam_P) {
       beam_fluxes[GetBeamBin(beam_energy_bins, beam_P)] += scale;
@@ -4269,8 +5021,8 @@ std::pair<double, size_t> protoana::AbsCexDriver::CalculateChi2(
   size_t alt_nPoints = 0;
 
   std::map<int, TH1 *> & selected_data_hists = data_set.GetSelectionHists();
-  double total_data = 0., total_mc = 0.;
-  double data_integral = 0.;
+  // double total_data = 0., total_mc = 0.; // unused
+  // double data_integral = 0.; // unused
   for (auto it = selected_data_hists.begin();
        it != selected_data_hists.end(); ++it) {
     TH1D * data_hist = (TH1D*)it->second;
@@ -4288,7 +5040,7 @@ std::pair<double, size_t> protoana::AbsCexDriver::CalculateChi2(
     }
 
 
-    data_integral += data_hist->Integral();
+    // data_integral += data_hist->Integral(); // unused
     int start = (fSkipFirstLast ? 2 : 1);
     int end = data_hist->GetNbinsX();
     if (fSkipFirstLast) --end;
@@ -4389,8 +5141,8 @@ std::pair<double, size_t> protoana::AbsCexDriver::CalculateChi2(
                      data_val << " mc_val " << mc_val << " chi2 isnan" << std::endl;
       }
       ++nPoints;
-      total_mc += mc_val;
-      total_data += data_val;
+      // total_mc += mc_val; // unused
+      // total_data += data_val; // unused
     }
     //std::cout << "Totals: " << total_data << " " << total_mc << std::endl;
   }
@@ -4635,7 +5387,8 @@ void protoana::AbsCexDriver::CompareSelections(
     full_mc_stack.Write();
   }
 
-  double total_muons = 0.;
+  /* total and total_muons set but not used
+  double total_muons = 0.; // unused
   double total = 0.;
   for (auto it = samples.begin(); it != samples.end(); ++it) {
     for (size_t i = 0; i < it->second.size(); ++i) {
@@ -4647,6 +5400,7 @@ void protoana::AbsCexDriver::CompareSelections(
       }
     }
   }
+  */
 }
 
 void protoana::AbsCexDriver::GetCurrentHists(
@@ -5088,6 +5842,7 @@ void protoana::AbsCexDriver::PlotThrows(
   }
 }
 
+//Can Be removed
 int protoana::AbsCexDriver::RecalculateSelectionID(
     const ThinSliceEvent & event,
     double C_cal,
@@ -5181,9 +5936,9 @@ double protoana::AbsCexDriver::TruncatedMean(const std::vector<double> & dEdX) {
 
 std::vector<double> protoana::AbsCexDriver::MakeTrueIncidentEnergies(
     const std::vector<double> & true_beam_traj_Z,
-    const std::vector<double> & true_beam_traj_KE,
+    const std::vector<double> & true_beam_traj_KE/*,
     const std::vector<int> & true_beam_slices,
-    const std::vector<double> & true_beam_incidentEnergies) {
+    const std::vector<double> & true_beam_incidentEnergies*/) {
 
   std::vector<double> results;
   if (fSliceMethod == "Traj") {
@@ -5214,13 +5969,13 @@ std::vector<double> protoana::AbsCexDriver::MakeTrueIncidentEnergies(
       }
     }
   }
-  else if (fSliceMethod == "Default") {
+  /*else if (fSliceMethod == "Default") {
     for (size_t j = 0; j < true_beam_incidentEnergies.size(); ++j) {
       int slice = true_beam_slices[j]; 
       if (slice > fSliceCut) continue;
       results.push_back(true_beam_incidentEnergies[j]);
     }
-  }
+  }*/
   else if (fSliceMethod == "Alt") {
     int bin = fEndSlices->GetXaxis()->FindBin(true_beam_traj_Z.back());
     for (int i = 1; i <= bin; ++i) {
@@ -5262,6 +6017,7 @@ void protoana::AbsCexDriver::ConstructCovariances(
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P
 
     /*const std::vector<ThinSliceEvent> & events,
@@ -5276,7 +6032,7 @@ void protoana::AbsCexDriver::ConstructCovariances(
       CovarianceRoutineBeamShift(
           events, nominal_samples, covariance_samples, signal_sample_checks,
           beam_energy_bins, nominal_fluxes, fluxes_by_sample, signal_pars,
-          flux_pars, syst_pars, fit_under_over, tie_under_over, use_beam_inst_P);
+          flux_pars, syst_pars, g4rw_pars, fit_under_over, tie_under_over, use_beam_inst_P);
     }
   }
 }
@@ -5318,6 +6074,42 @@ void protoana::AbsCexDriver::SetupBeamShiftCovRoutine(fhicl::ParameterSet & rout
   fBeamShiftNominalP2 = routine.get<double>("NominalP2");
 }
 
+void protoana::AbsCexDriver::TurnOnFakeData() {
+  fFakeDataActive = true;
+  if (fBeamShiftCovUseInput && fUseBeamShift) {
+    fBeamShiftCovRoutineActive = true;
+    OpenBeamShiftInput(); 
+    GenerateBeamShiftUniverse();
+  }
+}
+
+void protoana::AbsCexDriver::TurnOffFakeData() {
+  fFakeDataActive = false;
+  //Reset the beam shift universe if needed
+  if (fUseBeamShift) {
+    GenerateBeamShiftUniverse();
+    fBeamShiftCovRoutineActive = true;
+  }
+}
+
+void protoana::AbsCexDriver::OpenBeamShiftInput() {
+
+  if (fOpenedBeamShiftInput) return;
+  auto * beam_shift_file = TFile::Open(fBeamShiftInputFileName.c_str());
+
+  fBeamShiftInputCentrals = (TVectorD*)beam_shift_file->Get("centrals");
+
+  fBeamShiftInputCov = (TMatrixD*)beam_shift_file->Get("covariance");
+
+  fBeamShiftInputChol = TDecompChol(*fBeamShiftInputCov);
+  fBeamShiftInputChol.Decompose();
+  fBeamShiftInputCovL = (TMatrixD*)fBeamShiftInputChol.GetU().Clone();
+  fBeamShiftInputCovL->Transpose(fBeamShiftInputChol.GetU());
+
+  beam_shift_file->Close();
+  fOpenedBeamShiftInput = true;
+}
+
 void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
     const std::vector<ThinSliceEvent> & events,
     std::map<int, std::vector<std::vector<ThinSliceSample>>> & nominal_samples,
@@ -5329,12 +6121,14 @@ void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P) {
 
   fBeamShiftCovRoutineActive = true;
   if (fBeamShiftCovUseInput) {
+    OpenBeamShiftInput();
     //std::string beam_shift_input_file = routine.get<std::string>("InputName");
-    auto * beam_shift_file = TFile::Open(fBeamShiftInputFileName.c_str());
+    /*auto * beam_shift_file = TFile::Open(fBeamShiftInputFileName.c_str());
 
     fBeamShiftInputCentrals = (TVectorD*)beam_shift_file->Get("centrals");
     //fBeamShiftInputCentrals->SetDirectory(0);
@@ -5348,7 +6142,7 @@ void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
     fBeamShiftInputCovL->Transpose(fBeamShiftInputChol.GetU());
     //fBeamShiftInputChol.SetDirectory(0);
 
-    beam_shift_file->Close();
+    beam_shift_file->Close();*/
   }
 
   //Nominal samples -- get total histograms
@@ -5409,6 +6203,7 @@ void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
   //int fNCovarianceGens = 2;
   std::cout << "Generating covariance for beam shift" << std::endl;
   std::vector<std::vector<double>> all_new_vals;
+  fFakeDataActive = true;
   for (size_t gen_i = 0; gen_i < fNCovarianceGens; ++gen_i) {
 
     /*
@@ -5431,7 +6226,7 @@ void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
     }
 
     RefillMCSamples(events, new_samples, signal_sample_checks, beam_energy_bins,
-                    signal_pars, flux_pars, syst_pars, fit_under_over,
+                    signal_pars, flux_pars, syst_pars, g4rw_pars, fit_under_over,
                     tie_under_over, use_beam_inst_P);
     //To-do renormalize
 
@@ -5667,10 +6462,13 @@ void protoana::AbsCexDriver::CovarianceRoutineBeamShift(
   //Save the covariances in a new file
   //
   fBeamShiftCovRoutineActive = false;
+  fFakeDataActive = true;
 }
 
-double protoana::AbsCexDriver::GetBeamShiftDelta(const std::vector<double> & energies) {
-  if (energies.size() == 0) return 0.;
+//double protoana::AbsCexDriver::GetBeamShiftDelta(const std::vector<double> & energies) {
+double protoana::AbsCexDriver::GetBeamShiftDelta(double init_energy) {
+  //if (energies.size() == 0) return 0.;
+  if (init_energy < 0) return 0.;
 
   //Currently, Sungbin's work is in P_reco_BI - P_range_FF vs P_reco_BI
   //so we need to transform to P_reco_BI vs P_range_FF -- P_true_FF is approximately equal
@@ -5694,7 +6492,7 @@ double protoana::AbsCexDriver::GetBeamShiftDelta(const std::vector<double> & ene
   //
   // Also we have to subtract the nominal P_reco_BI vs P_true_FF
 
-  double energy = energies[0] + 139.57;
+  double energy = init_energy/*ies[0]*/ + 139.57;
   double true_P = sqrt(energy*energy - 139.57*139.57);
 
   if (fCurrentBeamShiftP2 < 0. && fCurrentBeamShiftP0 < 0.) {
@@ -5739,25 +6537,33 @@ double protoana::AbsCexDriver::GetBeamShiftDelta(const std::vector<double> & ene
 void protoana::AbsCexDriver::GenerateBeamShiftUniverse() {
 
     if (fBeamShiftCovUseInput) {
-      TVectorD rand(3);
-      for (size_t i = 0; i < 3; ++i) rand[i] = fRNG.Gaus();
 
-      std::cout << "Using input covariance" << std::endl;
-      for (size_t i = 0; i < 3; ++i) {
-        for (size_t j = 0; j < 3; ++j) {
-          //std::cout << fBeamShiftInputChol.GetU()[i][j] << " ";
-          std::cout << (*fBeamShiftInputCovL)[i][j] << " ";
+      fCurrentBeamShiftP0 =  (*fBeamShiftInputCentrals)[0];
+      fCurrentBeamShiftP1 =  (*fBeamShiftInputCentrals)[1];
+      fCurrentBeamShiftP2 =  (*fBeamShiftInputCentrals)[2];
+
+      if ((fRandomFakeDataBeamShift && fFakeDataActive) ||
+          (fRandomMCBeamShift && !fFakeDataActive)) {
+        TVectorD rand(3);
+        for (size_t i = 0; i < 3; ++i) rand[i] = fRNG.Gaus();
+
+        std::cout << "Using input covariance" << std::endl;
+        for (size_t i = 0; i < 3; ++i) {
+          for (size_t j = 0; j < 3; ++j) {
+            //std::cout << fBeamShiftInputChol.GetU()[i][j] << " ";
+            std::cout << (*fBeamShiftInputCovL)[i][j] << " ";
+          }
+          std::cout << std::endl;
         }
-        std::cout << std::endl;
+        //TVectorD rand_times_chol = fBeamShiftInputChol.GetU()*rand;
+        TVectorD rand_times_chol = (*fBeamShiftInputCovL)*rand;
+        for (size_t i = 0; i < 3; ++i) {
+          std::cout << "\t" << rand_times_chol[i] << std::endl;
+        }
+        fCurrentBeamShiftP0 += rand_times_chol[0];
+        fCurrentBeamShiftP1 += rand_times_chol[1];
+        fCurrentBeamShiftP2 += rand_times_chol[2];
       }
-      //TVectorD rand_times_chol = fBeamShiftInputChol.GetU()*rand;
-      TVectorD rand_times_chol = (*fBeamShiftInputCovL)*rand;
-      for (size_t i = 0; i < 3; ++i) {
-        std::cout << "\t" << rand_times_chol[i] << std::endl;
-      }
-      fCurrentBeamShiftP0 =  (*fBeamShiftInputCentrals)[0] + rand_times_chol[0];
-      fCurrentBeamShiftP1 =  (*fBeamShiftInputCentrals)[1] + rand_times_chol[1];
-      fCurrentBeamShiftP2 =  (*fBeamShiftInputCentrals)[2] + rand_times_chol[2];
     }
 
     else {
@@ -5769,4 +6575,113 @@ void protoana::AbsCexDriver::GenerateBeamShiftUniverse() {
     std::cout << /*gen_i <<*/ "Beam shift pars: " << fCurrentBeamShiftP0 <<
                  " " << fCurrentBeamShiftP1 << " " << fCurrentBeamShiftP2 <<
                  std::endl;
+}
+
+void protoana::AbsCexDriver::FillDataHistsFromSamples(
+    ThinSliceDataSet & data_set,
+    const std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
+    double & flux, std::vector<double> & fluxes_by_beam, bool fluctuate) {
+
+  auto & selection_hists = data_set.GetSelectionHists();
+
+  flux = 0.;
+  //std::vector<double> temp_flux(/*fluxes_by_beam.size()*/);
+  fluxes_by_beam.clear();
+  for (auto it = selection_hists.begin(); it != selection_hists.end(); ++it) {
+    it->second->Reset();
+  }
+
+
+  if (fluctuate) {
+    //Get total
+    double total = 0.;
+    int a = 0;
+    for (auto & sample : samples ) {
+      for (size_t i = 0; i < sample.second.size(); ++i) {
+        for (size_t j = 0; j < sample.second[i].size(); ++j) {
+          const auto & hists = sample.second[i][j].GetSelectionHists();
+          for (auto & hist : hists) {
+            total += hist.second->Integral();
+            std::cout << a << " " << i << " "  << j << " " << hist.second->Integral() << std::endl;
+            //std::cout << temp_flux.size() << std::endl;
+            //temp_flux[i] += hist.second->Integral();
+          }
+        }
+      }
+      ++a;
+    }
+    std::cout << "Total: " << total << std::endl;
+    //for (auto & f : temp_flux) {std::cout << f << " ";} std::cout << std::endl;
+
+
+    //First, iterate through all samples/hists. Vary the contents
+    //Skip accordingly. Get varied total
+    double varied_total = 0.;
+    double nominal_skip_total = 0.;
+    //std::map<int, double> nominal_skip_vals;
+    //for (auto i : fToSkip) nominal_skip_vals[i] = 0.;
+
+    for (auto & sample : samples ) {
+      auto & sample_vec = sample.second;
+      for (size_t i = 0; i < sample_vec.size(); ++i) {
+        for (size_t j = 0; j < sample_vec[i].size(); ++j) {
+          const auto & hists = sample_vec[i][j].GetSelectionHists();
+          for (auto & hist : hists) {
+            if (std::find(fToSkip.begin(), fToSkip.end(), hist.first)
+                != fToSkip.end()) {
+              nominal_skip_total += hist.second->Integral();
+              //nominal_skip_vals[hist.first] += hist.second->Integral();
+              continue;
+            }
+            for (int k = 1; k <= hist.second->GetNbinsX(); ++k) {
+              double val = hist.second->GetBinContent(k);
+              double rand = fRNG.PoissonD(val);
+              hist.second->SetBinContent(k, rand);
+            }
+            varied_total += hist.second->Integral();
+          }
+        }
+      }
+    }
+
+    double leftover = total - varied_total;
+    double ratio = leftover/nominal_skip_total;
+    std::cout << "Leftover: " << leftover << std::endl;
+    std::cout << "Nominal skip total " << nominal_skip_total << std::endl;
+
+    for (auto & sample : samples ) {
+      auto & sample_vec = sample.second;
+      for (size_t i = 0; i < sample_vec.size(); ++i) {
+        for (size_t j = 0; j < sample_vec[i].size(); ++j) {
+          const auto & hists = sample_vec[i][j].GetSelectionHists();
+          for (auto k : fToSkip) {
+            if (hists.find(k) == hists.end()) continue;
+            //std::cout << "Scaling " << k << " " << hists.at(k)->Integral() <<
+            //             " " << ratio << std::endl;
+            hists.at(k)->Scale(ratio);
+          }
+        }
+      }
+    }
+  }
+
+  int a = 0;
+  for (auto it = samples.begin(); it != samples.end(); ++it) {
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      if (a == 0) fluxes_by_beam.push_back(0.);
+      for (size_t j = 0; j < it->second[i].size(); ++j) {
+        const auto & hists = it->second[i][j].GetSelectionHists();
+
+        for (auto it2 = hists.begin(); it2 != hists.end(); ++it2) {
+
+          selection_hists[it2->first]->Add(it2->second);
+          flux += it2->second->Integral();
+          fluxes_by_beam[i] += it2->second->Integral();
+          //std::cout << "Adding " << it2->second->Integral() << " to " << i << std::endl;
+        }
+      }
+    }
+    ++a;
+  }
+  std::cout << "Flux: " << flux << std::endl;
 }

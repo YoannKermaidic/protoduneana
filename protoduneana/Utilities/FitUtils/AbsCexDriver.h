@@ -16,6 +16,39 @@
 #include <mutex>
 
 namespace protoana {
+
+struct ExtraHistDataVars {
+  ExtraHistDataVars(int selid, double endz, double startx, double starty,
+                    double startz, double michel, int nhits)
+    : selection_ID(selid), reco_endz(endz),
+      reco_startx_sce(startx), reco_starty_sce(starty), reco_startz_sce(startz),
+      vertex_michel_score(michel), vertex_nhits(nhits)
+  {};
+
+  void AddRecoProductTrackScores(std::vector<double> & scores) {
+    reco_product_track_scores = scores;
+    //reco_product_track_scores.insert(reco_product_track_scores.begin(),
+    //                                 scores.begin(),
+    //                                 scores.end());
+  };
+
+  void AddRecoProductTrunc_dEdXs(std::vector<double> & vals) {
+    reco_product_truncated_dEdXs = vals;
+  };
+  void AddRecoProductChi2sPerHit(std::vector<double> & vals) {
+    reco_product_chi2s_per_hit = vals;
+  };
+
+  int selection_ID;
+  double reco_endz;
+  double reco_startx_sce, reco_starty_sce, reco_startz_sce;
+  double vertex_michel_score;
+  int vertex_nhits;
+  std::vector<double> reco_product_track_scores,
+                      reco_product_truncated_dEdXs,
+                      reco_product_chi2s_per_hit;
+};
+
 class AbsCexDriver : public ThinSliceDriver {
  public:
   AbsCexDriver(const fhicl::ParameterSet & extra_options);
@@ -25,13 +58,21 @@ class AbsCexDriver : public ThinSliceDriver {
     TTree * tree, std::vector<ThinSliceEvent> & events,
     std::vector<ThinSliceEvent> & fake_data_events,
     int & split_val, const bool & do_split, const bool & shuffle,
-    int max_entries, const bool & do_fake_data) override;
+    int max_entries, int max_fake_entries,
+    const bool & do_fake_data) override;
 
   void BuildDataHists(
     TTree * tree, ThinSliceDataSet & data_set, double & flux,
     const std::vector<double> & beam_energy_bins,
     std::vector<double> & beam_fluxes,
     int split_val = 0) override;
+
+  void FillDataHistsFromSamples(
+    ThinSliceDataSet & data_set,
+    const std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
+    double & flux, std::vector<double> & fluxes_by_beam, bool fluctuate
+  ) override;
+
   void BuildFakeData(
     TTree * tree, const std::vector<ThinSliceEvent> & events,
     std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
@@ -140,6 +181,7 @@ class AbsCexDriver : public ThinSliceDriver {
       const std::map<int, std::vector<double>> & signal_pars,
       const std::map<int, double> & flux_pars,
       const std::map<std::string, ThinSliceSystematic> & syst_pars,
+      const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
       bool fit_under_over, bool tie_under_over, bool use_beam_inst_P,
       bool fill_incident, std::map<int, TH1 *> * fix_factors,
       size_t worker_id, std::vector<size_t> n_events);
@@ -153,6 +195,7 @@ class AbsCexDriver : public ThinSliceDriver {
       const std::map<int, std::vector<double>> & signal_pars,
       const std::map<int, double> & flux_pars,
       const std::map<std::string, ThinSliceSystematic> & syst_pars,
+      const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
       bool fit_under_over, bool tie_under_over,
       bool use_beam_inst_P, bool fill_incident = false,
       std::map<int, TH1*> * fix_factors = 0x0) override;
@@ -238,6 +281,7 @@ class AbsCexDriver : public ThinSliceDriver {
       const std::map<int, bool> & signal_sample_checks,
       std::vector<double> & beam_energy_bins,
       const std::map<std::string, ThinSliceSystematic> & pars,
+      const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
       TFile & output_file) override;
 
   /*void SetupSyst_BeamRes(
@@ -349,6 +393,7 @@ class AbsCexDriver : public ThinSliceDriver {
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P
 
     /*   const std::vector<ThinSliceEvent> & events,
@@ -358,6 +403,13 @@ class AbsCexDriver : public ThinSliceDriver {
        std::map<int, double> & nominal_fluxes,
        std::map<int, std::vector<std::vector<double>>> & fluxes_by_sample,
        std::vector<double> & beam_energy_bins, bool use_beam_inst_P*/) override;
+  void SetupExtraHists(
+    ThinSliceDataSet & data_set, 
+    std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
+    std::map<int, std::vector<std::vector<ThinSliceSample>>> & fake_samples) override;
+
+  void TurnOnFakeData() override;
+  void TurnOffFakeData() override;
 
  private:
    TH2D * fEndSlices;
@@ -407,9 +459,9 @@ class AbsCexDriver : public ThinSliceDriver {
 
    std::vector<double> MakeTrueIncidentEnergies(
      const std::vector<double> & true_beam_traj_Z,
-     const std::vector<double> & true_beam_traj_KE,
+     const std::vector<double> & true_beam_traj_KE/*,
      const std::vector<int> & true_beam_slices,
-     const std::vector<double> & true_beam_incidentEnergies);
+     const std::vector<double> & true_beam_incidentEnergies*/);
 
   
    int GetBeamBin(
@@ -427,6 +479,7 @@ class AbsCexDriver : public ThinSliceDriver {
     const std::map<int, std::vector<double>> & signal_pars,
     const std::map<int, double> & flux_pars,
     const std::map<std::string, ThinSliceSystematic> & syst_pars,
+    const std::map<std::string, ThinSliceSystematic> & g4rw_pars,
     bool fit_under_over, bool tie_under_over, bool use_beam_inst_P);
     //   const std::vector<ThinSliceEvent> & events,
     //   std::map<int, std::vector<std::vector<ThinSliceSample>>> & nominal_samples,
@@ -436,18 +489,76 @@ class AbsCexDriver : public ThinSliceDriver {
     //   std::map<int, std::vector<std::vector<double>>> & fluxes_by_sample,
     //   std::vector<double> & beam_energy_bins, bool use_beam_inst_P);
 
+   void OpenBeamShiftInput();
    void SetupBeamShiftCovRoutine(fhicl::ParameterSet & routine);
-   double GetBeamShiftDelta(const std::vector<double> & energies);
+   //double GetBeamShiftDelta(const std::vector<double> & energies);
+   double GetBeamShiftDelta(double energy);
    void GenerateBeamShiftUniverse();
 
    void ScaleSamples(
       std::map<int, std::vector<std::vector<ThinSliceSample>>> & samples,
       double scale);
 
-   double GetFakeWeight_G4RWCoeff(
-      const ThinSliceEvent & event,
+   void SetupFakeDataG4RW();
+
+   static double GetFakeWeight_G4RWCoeff(
+      const ThinSliceEvent & event/*,
       const std::vector<std::string> & branches,
-      const std::vector<double> & vars);
+      const std::vector<double> & vars*/);
+
+   //void SetupExtraHists(ThinSliceDataSet & data_set);
+   //void SetupExtraHistEndZ();
+   static void FillExtraHistDataEndZ(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataEndZGoodReco(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataStartX(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataStartY(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataStartZ(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataTrackScore(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataVertexMichel(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataTrunc_dEdX(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   static void FillExtraHistDataChi2PerHit(ThinSliceDataSet & data_set,
+                                 const ExtraHistDataVars & vars);
+   void FillExtraHistsData(ThinSliceDataSet & data_set,
+                           const ExtraHistDataVars & vars);
+
+   static void FillExtraHistMCEndZ(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCEndZGoodReco(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCStartX(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCStartY(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCStartZ(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCTrackScore(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCVertexMichel(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCTrunc_dEdX(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   static void FillExtraHistMCChi2PerHit(ThinSliceSample & sample,
+                                   const ThinSliceEvent & event,
+                                   double weight);
+   void FillExtraHistsMC(ThinSliceSample & sample,
+                         const ThinSliceEvent & event,
+                         double weight);
 
    TH1D fBeamShiftRatioNomHist;
    std::vector<TSpline3*> fBeamShiftRatioSplines;
@@ -455,12 +566,13 @@ class AbsCexDriver : public ThinSliceDriver {
 
    std::vector<double> fBeamMatchLimits, fBeamMatchFractions;
    PDSPSystematics * fSystematics = 0x0;
+   PDSPSystematics * fG4RWPars = 0x0;
 
    bool fInclusive;
    std::vector<int> fERecoSelections, fEndZSelections, fOneBinSelections;
    double fBeamInstPScale/*, fMCBeamInstPShift*/;
    bool fRestrictBeamInstP, fDebugRestrictBeamP;
-   bool fVaryDataCalibration;
+   bool fVaryDataCalibration, fThrowCalibration, fVaryCalibrationFakeData;
    double fDataCalibrationFactor;
    bool fBarlowBeeston;
    std::vector<int> fToSkip;
@@ -469,6 +581,7 @@ class AbsCexDriver : public ThinSliceDriver {
 
    std::vector<std::string> fCovarianceRoutines;
    bool fBeamShiftCovRoutineActive = false;
+   bool fRandomFakeDataBeamShift, fRandomMCBeamShift, fUseBeamShift, fOpenedBeamShiftInput = false, fDoingCovCreate = false;
    std::string fBeamShiftCovOutput;
    size_t fNCovarianceGens;
    std::pair<double, double> fBeamShiftCovP0, fBeamShiftCovP1, fBeamShiftCovP2;
@@ -482,6 +595,52 @@ class AbsCexDriver : public ThinSliceDriver {
    double fCurrentBeamShiftP0, fCurrentBeamShiftP1, fCurrentBeamShiftP2;
    std::mutex fRefillMutex, fFillMutex;
    int fNThreads;
+   std::vector<fhicl::ParameterSet> fExtraHistSets;
+   double fFakeResolution = -999.;
+   std::vector<std::vector<double>> fStoredEnergies;
+   bool fUseStoredEnergies = false;
+
+   std::vector<std::pair<std::string, std::function<void(
+       ThinSliceDataSet & data_set, const ExtraHistDataVars & vars)>>>
+           fActiveExtraHistsData;
+   std::vector<std::pair<std::string, std::function<void(
+       ThinSliceSample & sample, const ThinSliceEvent & event, double weight)>>>
+           fActiveExtraHistsMC;
+
+   std::map<std::string, std::function<void(
+       ThinSliceDataSet & data_set, const ExtraHistDataVars & vars)>>
+           fStoredExtraHistsData = {
+    {"EndZ", FillExtraHistDataEndZ},
+    {"EndZGoodReco", FillExtraHistDataEndZGoodReco},
+    {"StartX", FillExtraHistDataStartX},
+    {"StartY", FillExtraHistDataStartY},
+    {"StartZ", FillExtraHistDataStartZ},
+    {"TrackScore", FillExtraHistDataTrackScore},
+    {"Trunc_dEdX", FillExtraHistDataTrunc_dEdX},
+    {"Chi2PerHit", FillExtraHistDataChi2PerHit}
+  };
+  std::map<std::string, std::function<void(
+       ThinSliceSample & sample, const ThinSliceEvent & event, double weight)>>
+           fStoredExtraHistsMC = {
+    {"EndZ", FillExtraHistMCEndZ},
+    {"EndZGoodReco", FillExtraHistMCEndZGoodReco},
+    {"StartX", FillExtraHistMCStartX},
+    {"StartY", FillExtraHistMCStartY},
+    {"StartZ", FillExtraHistMCStartZ},
+    {"TrackScore", FillExtraHistMCTrackScore},
+    {"Trunc_dEdX", FillExtraHistMCTrunc_dEdX},
+    {"Chi2PerHit", FillExtraHistMCChi2PerHit}
+  };
+
+  std::function<double(const ThinSliceEvent & event)> FakeDataWeight;
+  static double DummyWeight(const ThinSliceEvent & event) {return 1.;};
+
+  static double fStartXDataMean, fStartXMCMean, 
+                fStartYDataMean, fStartYMCMean,
+                fStartZDataMean, fStartZMCMean,
+                fStartXDataSigma, fStartXMCSigma, 
+                fStartYDataSigma, fStartYMCSigma,
+                fStartZDataSigma, fStartZMCSigma;
 };
 }
 #endif

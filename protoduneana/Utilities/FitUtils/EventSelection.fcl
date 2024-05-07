@@ -11,6 +11,7 @@ EndZHigh: 222.10561
 EndZLow: -.49375
 Threshold: .150
 CexNPi0: true
+SignalPastFV: true
 TrackScoreCut: 0.3
 Limit: 0.16
 
@@ -25,11 +26,11 @@ DoNTracks: false
 DoMichel: true 
 MichelCut: 0.6
 
-RestrictBeamP: true
+RestrictBeamP: false #true
 BeamPLow: 750.
 BeamPHigh: 1250.
 
-RestrictBeamXY: true
+RestrictBeamXY: false
 BeamYMean: 422.
 BeamXMean: -30.
 DataBeamYMean: 423.
