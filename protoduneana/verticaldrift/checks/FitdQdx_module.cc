@@ -177,7 +177,7 @@ private:
   bool   HitsInYZVolume(float fX, float fY, float fZ);
   bool   HitsInFiducialVolume(float fX, float fY, float fZ);
   void   GetAngles(const recob::Track& track, bool isRevert, float &theta, float &phi);
-  TF1*   LGfit(TH1F* hin);
+  TF1*   LGfit(TH1F* hin,bool);
 
   //GnocchiCalorimetry module functions
   bool HitIsValid(const art::Ptr<recob::Hit> hit,
@@ -269,7 +269,7 @@ void pdvdana::FitdQdx::analyze(art::Event const& e)
       }
 
       // Cut tracks that are not within specified thresholds
-      if(track.Length() < fTrackLenMin || track.Length() > fTrackLenMax){fTree->Fill(); fTrackId++; continue;}
+      if(track.Length() < fTrackLenMin || track.Length() > fTrackLenMax) continue;
 
       // Retrieve begining and end of the track
       fTrackStartX = track.Start().X();
@@ -280,16 +280,16 @@ void pdvdana::FitdQdx::analyze(art::Event const& e)
       fTrackEndZ   = track.End().Z();
 
       // Remove tracks that start outside the detector in the horizontal plane
-      if(fTrackStartY < fYmin || fTrackStartY > fYmax){fTree->Fill(); fTrackId++;  continue;}
-      if(fTrackStartZ < fZmin || fTrackStartZ > fZmax){fTree->Fill(); fTrackId++;  continue;}
+      if(fTrackStartY < fYmin || fTrackStartY > fYmax) continue;
+      if(fTrackStartZ < fZmin || fTrackStartZ > fZmax) continue;
 
       // Remove tracks that end   outside the detector in the horizontal plane
-      if(fTrackEndY < fYmin   || fTrackEndY > fYmax){fTree->Fill(); fTrackId++;    continue;}
-      if(fTrackEndZ < fZmin   || fTrackEndZ > fZmax){fTree->Fill(); fTrackId++;    continue;}
+      if(fTrackEndY < fYmin   || fTrackEndY > fYmax)   continue;
+      if(fTrackEndZ < fZmin   || fTrackEndZ > fZmax)   continue;
      
       // Remove tracks that are not crossing the anode/cathode planes
       // -> unknown drift time
-      if(fabs(fTrackStartX - fTrackEndX) < 0.95*fHeight || fabs(fTrackStartX - fTrackEndX) > 1.05*fHeight){fTree->Fill(); fTrackId++; continue;}
+      if(fabs(fTrackStartX - fTrackEndX) < 0.95*fHeight || fabs(fTrackStartX - fTrackEndX) > 1.05*fHeight) continue;
 
       // Check if the track is reconstructed upwards or downwards
       // for now, assume all reconstructed muons should be going downwards
@@ -626,9 +626,11 @@ double langaufun(double *x, double *par) {
    return (par[2] * step * sum * invsq2pi / par[3] + baseline);
 }
 
-TF1* pdvdana::FitdQdx::LGfit(TH1F* hin){
+TF1* pdvdana::FitdQdx::LGfit(TH1F* hin,bool iscorrected){
 
-  TF1* fit = new TF1("fit",langaufun,5,20,5);
+  TF1* fit;
+  if(!iscorrected) fit = new TF1("fit",langaufun,fDQdxFitMin,fDQdxFitMax,5);
+  else             fit = new TF1("fit",langaufun,5,20,5);
   fit->SetParameters(1.,
                      hin->GetBinCenter(hin->GetMaximumBin()),
                      hin->Integral(),
@@ -681,7 +683,7 @@ void pdvdana::FitdQdx::endJob()
       }
 
       // Perform gaus convolved landau fit of each dQ/dx distribution
-      TF1* f_dqdx = LGfit(hFit);
+      TF1* f_dqdx = LGfit(hFit,false);
 
       // Remove points with unexpectedly too small or too large uncertainty from the final fit
       if(f_dqdx->GetParError(1)/f_dqdx->GetParameter(1) < 0.05/100. || f_dqdx->GetParError(1)/f_dqdx->GetParameter(1) > 5./100.) continue;
@@ -699,7 +701,7 @@ void pdvdana::FitdQdx::endJob()
       f_dqdx_z[plane_i]->SetParameter(0,g_dqdx_z[plane_i]->GetY()[5]);
       f_dqdx_z[plane_i]->SetParameter(1,0.01);
       f_dqdx_z[plane_i]->SetParLimits(0,fDQdxFitMin,fDQdxFitMax);
-      f_dqdx_z[plane_i]->SetParLimits(1,1e-4,1e-2);
+      f_dqdx_z[plane_i]->SetParLimits(1,1e-5,1.);
       g_dqdx_z[plane_i]->Fit(f_dqdx_z[plane_i],"R");
  
       tau[plane_i]  = 1./(f_dqdx_z[plane_i]->GetParameter(1));
@@ -767,7 +769,7 @@ void pdvdana::FitdQdx::endJob()
 
   // Perform gaus convolved landau + step fit of the global dQ/dx distribution
   for(unsigned int plane_i = 0;plane_i<fNplanes;plane_i++){
-    TF1* f_dqdx = LGfit(h_dqdx_cor[plane_i]);
+    TF1* f_dqdx = LGfit(h_dqdx_cor[plane_i],true);
 
     mDqdx[plane_i]   = f_dqdx->GetParameter(1);
     dmDqdx[plane_i]  = f_dqdx->GetParError(1);
