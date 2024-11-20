@@ -94,13 +94,13 @@ void pdvdana::CheckMCevents::analyze(art::Event const& e)
    else
      std::cout << "True PDG: " << true_particle->PdgCode() << std::endl;
 
-/*
+
    // Hits
    std::vector<art::Ptr<recob::Hit> > hitlist;
-   auto hitListHandle = event.getHandle< std::vector<recob::Hit> >(fHitModuleLabel);
+   auto hitListHandle = e.getHandle< std::vector<recob::Hit> >(fHitModuleLabel);
    if (hitListHandle)
      art::fill_ptr_vector(hitlist, hitListHandle);
-
+/*
    // PFParticles
    std::vector < art::Ptr < recob::PFParticle > > pfpList;
    auto pfpListHandle = event.getHandle < std::vector < recob::PFParticle > >(fPFPModuleLabel);
@@ -119,7 +119,8 @@ void pdvdana::CheckMCevents::analyze(art::Event const& e)
        std::cout << "Mother particle is " << particle->PdgCode() << std::endl;
      }
    }
-  
+
+
 /*
    double purity = truthUtil.GetPurity( clockData, *daughterPFP, e, fPFParticleTag);
    double completeness = truthUtil.GetCompleteness( clockData, *daughterPFP, e, fPFParticleTag, fHitTag );
